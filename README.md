@@ -183,6 +183,42 @@ The processing stage automatically discovers markets that weren't in the initial
 **Issue**: Rate limiting
 **Solution**: The pipeline handles this automatically with exponential backoff
 
+## Analysis
+
+### Loading Data
+
+```python
+import pandas as pd
+import polars as pl
+from poly_utils import get_markets, PLATFORM_WALLETS
+
+# Load markets
+markets_df = get_markets()
+
+# Load trades
+df = pl.scan_csv("processed/trades.csv").collect(streaming=True)
+df = df.with_columns(
+    pl.col("timestamp").str.to_datetime().alias("timestamp")
+)
+```
+
+### Filtering Trades by User
+
+**Important**: When filtering for a specific user's trades, filter by the `maker` column. Even though it appears you're only getting trades where the user is the maker, this is how Polymarket generates events at the contract level. The `maker` column shows trades from that user's perspective including price.
+
+```python
+USERS = {
+    'domah': '0x9d84ce0306f8551e02efef1680475fc0f1dc1344',
+    '50pence': '0x3cf3e8d5427aed066a7a5926980600f6c3cf87b3',
+    'fhantom': '0x6356fb47642a028bc09df92023c35a21a0b41885',
+    'car': '0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b',
+    'theo4': '0x56687bf447db6ffa42ffe2204a05edaa20f55839'
+}
+
+# Get all trades for a specific user
+trader_df = df.filter((pl.col("maker") == USERS['domah']))
+```
+
 ## License
 
-This project is for data collection and analysis purposes.
+Go wild with it
