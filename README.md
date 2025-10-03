@@ -10,10 +10,23 @@ This pipeline performs three main operations:
 2. **Order Event Scraping** - Collects order-filled events from Goldsky subgraph
 3. **Trade Processing** - Transforms raw order events into structured trade data
 
+## Installation
+
+This project uses [UV](https://docs.astral.sh/uv/) for fast, reliable dependency management.
+
+```bash
+# Install dependencies
+uv sync
+
+# Or if you want dev dependencies (Jupyter)
+uv sync --group dev
+```
+
 ## Quick Start
 
 ```bash
-python update_all.py
+# Run the pipeline
+uv run python update_all.py
 ```
 
 This will sequentially run all three pipeline stages:
@@ -125,16 +138,21 @@ process_live()
 
 ## Dependencies
 
+Dependencies are managed via `pyproject.toml` and installed with UV:
+
 ```bash
-pip install pandas polars requests gql flatten-json
+uv sync
 ```
 
-**Key Libraries**:
+**Key Libraries** (see `pyproject.toml` for versions):
 - `polars` - Fast DataFrame operations
 - `pandas` - Data manipulation
-- `gql` - GraphQL client for Goldsky
+- `gql[requests]` - GraphQL client for Goldsky
 - `requests` - HTTP requests to Polymarket API
 - `flatten-json` - JSON flattening for nested responses
+
+**Development Dependencies**:
+- `jupyter` - For interactive analysis (install with `uv sync --group dev`)
 
 ## Features
 
