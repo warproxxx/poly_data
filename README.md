@@ -2,6 +2,10 @@
 
 A comprehensive data pipeline for fetching, processing, and analyzing Polymarket trading data. This system collects market information, order-filled events, and processes them into structured trade data.
 
+## Quick Download
+
+**First-time users**: Download the [latest data snapshot](https://drive.google.com/file/d/15Lx22ulvCF59RSXHUo4MOAzesPz_w5xe/view?usp=sharing) and extract it in the main repository directory before your first run. This will save you over 2 days of initial data collection time.
+
 ## Overview
 
 This pipeline performs three main operations:
