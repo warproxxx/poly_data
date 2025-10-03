@@ -14,6 +14,9 @@ dependencies = [
     "requests>=2.31.0",
     "gql[requests]>=3.5.0",
     "flatten-json>=0.1.13",
+    "matplotlib>=3.8.0",
+    "numpy>=1.26.0",
+    "seaborn>=0.13.0",
 ]
 
 [tool.uv]
