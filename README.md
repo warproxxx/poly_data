@@ -39,23 +39,24 @@ This will sequentially run all three pipeline stages:
 ```
 poly_data/
 ├── update_all.py              # Main orchestrator script
+├── migrate_csv_to_parquet.py  # Migration tool for existing CSV data
 ├── update_utils/              # Data collection modules
 │   ├── update_markets.py      # Fetch markets from Polymarket API
 │   ├── update_goldsky.py      # Scrape order events from Goldsky
 │   └── process_live.py        # Process orders into trades
 ├── poly_utils/                # Utility functions
 │   └── utils.py               # Market loading and missing token handling
-├── markets.csv                # Main markets dataset
-├── missing_markets.csv        # Markets discovered from trades (auto-generated)
+├── markets.parquet            # Main markets dataset
+├── missing_markets.parquet    # Markets discovered from trades (auto-generated)
 ├── goldsky/                   # Order-filled events (auto-generated)
-│   └── orderFilled.csv
+│   └── orderFilled.parquet
 └── processed/                 # Processed trade data (auto-generated)
-    └── trades.csv
+    └── trades.parquet
 ```
 
 ## Data Files
 
-### markets.csv
+### markets.parquet
 Market metadata including:
 - Market question, outcomes, and tokens
 - Creation/close times and slugs
@@ -64,7 +65,7 @@ Market metadata including:
 
 **Fields**: `createdAt`, `id`, `question`, `answer1`, `answer2`, `neg_risk`, `market_slug`, `token1`, `token2`, `condition_id`, `volume`, `ticker`, `closedTime`
 
-### goldsky/orderFilled.csv
+### goldsky/orderFilled.parquet
 Raw order-filled events with:
 - Maker/taker addresses and asset IDs
 - Fill amounts and transaction hashes
@@ -72,13 +73,21 @@ Raw order-filled events with:
 
 **Fields**: `timestamp`, `maker`, `makerAssetId`, `makerAmountFilled`, `taker`, `takerAssetId`, `takerAmountFilled`, `transactionHash`
 
-### processed/trades.csv
+### processed/trades.parquet
 Structured trade data including:
 - Market ID mapping and trade direction
 - Price, USD amount, and token amount
 - Maker/taker roles and transaction details
 
 **Fields**: `timestamp`, `market_id`, `maker`, `taker`, `nonusdc_side`, `maker_direction`, `taker_direction`, `price`, `usd_amount`, `token_amount`, `transactionHash`
+
+## Parquet Format Benefits
+
+All data is now stored in Parquet format, providing:
+- **50-80% smaller file sizes** through columnar compression
+- **10-100x faster read performance** for analytical queries
+- **Native type preservation** (no type inference needed)
+- **Better memory efficiency** when loading data
 
 ## Pipeline Stages
 
@@ -158,8 +167,8 @@ uv sync
 
 ### Resumable Operations
 All stages automatically resume from where they left off:
-- **Markets**: Counts existing CSV rows to set offset
-- **Goldsky**: Reads last timestamp from orderFilled.csv
+- **Markets**: Counts existing Parquet rows to set offset
+- **Goldsky**: Reads last timestamp from orderFilled.parquet
 - **Processing**: Finds last processed transaction hash
 
 ### Error Handling
@@ -169,7 +178,19 @@ All stages automatically resume from where they left off:
 - Graceful fallbacks for missing data
 
 ### Missing Market Discovery
-The processing stage automatically discovers markets that weren't in the initial markets.csv (e.g., markets created after last update) and fetches them via the Polymarket API, saving to `missing_markets.csv`.
+The processing stage automatically discovers markets that weren't in the initial markets.parquet (e.g., markets created after last update) and fetches them via the Polymarket API, saving to `missing_markets.parquet`.
+
+### Migrating from CSV to Parquet
+If you have existing CSV data, use the migration script:
+
+```bash
+python migrate_csv_to_parquet.py
+```
+
+This will:
+- Convert all CSV files to Parquet format
+- Show file size savings
+- Preserve all data integrity
 
 ## Data Schema Details
 
@@ -206,18 +227,17 @@ The processing stage automatically discovers markets that weren't in the initial
 ### Loading Data
 
 ```python
-import pandas as pd
 import polars as pl
-from poly_utils import get_markets, PLATFORM_WALLETS
+from poly_utils.utils import get_markets, PLATFORM_WALLETS
 
 # Load markets
 markets_df = get_markets()
 
 # Load trades
-df = pl.scan_csv("processed/trades.csv").collect(streaming=True)
-df = df.with_columns(
-    pl.col("timestamp").str.to_datetime().alias("timestamp")
-)
+df = pl.read_parquet("processed/trades.parquet")
+
+# Or use lazy loading for better performance
+df = pl.scan_parquet("processed/trades.parquet").collect(streaming=True)
 ```
 
 ### Filtering Trades by User

@@ -8,10 +8,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import polars as pl
 from poly_utils.utils import get_markets, update_missing_tokens
 
-import subprocess
-
-import pandas as pd
-
 def get_processed_df(df):
     markets_df = get_markets()
     markets_df = markets_df.rename({'id': 'market_id'})
@@ -102,7 +98,7 @@ def get_processed_df(df):
 
 
 def process_live():
-    processed_file = 'processed/trades.csv'
+    processed_file = 'processed/trades.parquet'
 
     print("=" * 60)
     print("🔄 Processing Live Trades")
@@ -112,63 +108,64 @@ def process_live():
 
     if os.path.exists(processed_file):
         print(f"✓ Found existing processed file: {processed_file}")
-        result = subprocess.run(['tail', '-n', '1', processed_file], capture_output=True, text=True)
-        last_line = result.stdout.strip()
-        splitted = last_line.split(',')
+        existing_trades = pl.read_parquet(processed_file)
+        if len(existing_trades) > 0:
+            last_row = existing_trades.tail(1)
+            last_processed['timestamp'] = last_row['timestamp'][0]
+            last_processed['transactionHash'] = last_row['transactionHash'][0]
+            last_processed['maker'] = last_row['maker'][0]
+            last_processed['taker'] = last_row['taker'][0]
 
-        last_processed['timestamp'] = pd.to_datetime(splitted[0])
-        last_processed['transactionHash'] = splitted[-1]
-        last_processed['maker'] = splitted[2]
-        last_processed['taker'] = splitted[3]
-        
-        print(f"📍 Resuming from: {last_processed['timestamp']}")
-        print(f"   Last hash: {last_processed['transactionHash'][:16]}...")
+            print(f"📍 Resuming from: {last_processed['timestamp']}")
+            print(f"   Last hash: {last_processed['transactionHash'][:16]}...")
     else:
         print("⚠ No existing processed file found - processing from beginning")
 
-    print(f"\n📂 Reading: goldsky/orderFilled.csv")
+    print(f"\n📂 Reading: goldsky/orderFilled.parquet")
 
-    schema_overrides = {
-        "takerAssetId": pl.Utf8,
-        "makerAssetId": pl.Utf8,
-    }
-
-    df = pl.scan_csv("goldsky/orderFilled.csv", schema_overrides=schema_overrides).collect(streaming=True)
+    df = pl.read_parquet("goldsky/orderFilled.parquet")
     df = df.with_columns(
         pl.from_epoch(pl.col('timestamp'), time_unit='s').alias('timestamp')
     )
 
     print(f"✓ Loaded {len(df):,} rows")
 
-    df = df.with_row_index()
+    if last_processed:
+        df = df.with_row_index()
 
-    same_timestamp = df.filter(pl.col('timestamp') == last_processed['timestamp'])
-    same_timestamp = same_timestamp.filter(
-        (pl.col("transactionHash") == last_processed['transactionHash']) & (pl.col("maker") == last_processed['maker']) & (pl.col("taker") == last_processed['taker'])
-    )
+        same_timestamp = df.filter(pl.col('timestamp') == last_processed['timestamp'])
+        same_timestamp = same_timestamp.filter(
+            (pl.col("transactionHash") == last_processed['transactionHash']) &
+            (pl.col("maker") == last_processed['maker']) &
+            (pl.col("taker") == last_processed['taker'])
+        )
 
-    df_process = df.filter(pl.col('index') > same_timestamp.row(0)[0])
-    df_process = df_process.drop('index')
+        if len(same_timestamp) > 0:
+            df_process = df.filter(pl.col('index') > same_timestamp.row(0)[0])
+            df_process = df_process.drop('index')
+        else:
+            df_process = df.drop('index')
+    else:
+        df_process = df
 
     print(f"⚙️  Processing {len(df_process):,} new rows...")
 
     new_df = get_processed_df(df_process)
-    
+
     if not os.path.isdir('processed'):
         os.makedirs('processed')
 
-
-    op_file = 'processed/trades.csv'
+    op_file = 'processed/trades.parquet'
 
     if not os.path.isfile(op_file):
-        new_df.write_csv(op_file)
-        print(f"✓ Created new file: processed/trades.csv")
+        new_df.write_parquet(op_file, compression="zstd")
+        print(f"✓ Created new file: processed/trades.parquet")
     else:
-        print(f"✓ Appending {len(new_df):,} rows to processed/trades.csv")
-        with open(op_file, mode="a") as f:
-            new_df.write_csv(f, include_header=False)
+        print(f"✓ Appending {len(new_df):,} rows to processed/trades.parquet")
+        existing_df = pl.read_parquet(op_file)
+        combined_df = pl.concat([existing_df, new_df])
+        combined_df.write_parquet(op_file, compression="zstd")
 
-    
     print("=" * 60)
     print("✅ Processing complete!")
     print("=" * 60)
