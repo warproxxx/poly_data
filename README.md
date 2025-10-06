@@ -14,9 +14,41 @@ This pipeline performs three main operations:
 2. **Order Event Scraping** - Collects order-filled events from Goldsky subgraph
 3. **Trade Processing** - Transforms raw order events into structured trade data
 
+## Installation
+
+This project uses [UV](https://docs.astral.sh/uv/) for fast, reliable package management.
+
+### Install UV
+
+```bash
+# macOS/Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# Or with pip
+pip install uv
+```
+
+### Install Dependencies
+
+```bash
+# Install all dependencies
+uv sync
+
+# Install with development dependencies (Jupyter, etc.)
+uv sync --extra dev
+```
+
 ## Quick Start
 
 ```bash
+# Run with UV (recommended)
+uv run python update_all.py
+
+# Or activate the virtual environment first
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 python update_all.py
 ```
 
@@ -83,9 +115,8 @@ Fetches all markets from Polymarket API in chronological order.
 - Batch fetching (500 markets per request)
 
 **Usage**:
-```python
-from update_utils.update_markets import update_markets
-update_markets()
+```bash
+uv run python -c "from update_utils.update_markets import update_markets; update_markets()"
 ```
 
 ### 2. Update Goldsky (`update_goldsky.py`)
@@ -98,9 +129,8 @@ Scrapes order-filled events from Goldsky subgraph API.
 - Deduplicates events
 
 **Usage**:
-```python
-from update_utils.update_goldsky import update_goldsky
-update_goldsky()
+```bash
+uv run python -c "from update_utils.update_goldsky import update_goldsky; update_goldsky()"
 ```
 
 ### 3. Process Live Trades (`process_live.py`)
@@ -115,9 +145,8 @@ Processes raw order events into structured trades.
 - Incremental processing from last checkpoint
 
 **Usage**:
-```python
-from update_utils.process_live import process_live
-process_live()
+```bash
+uv run python -c "from update_utils.process_live import process_live; process_live()"
 ```
 
 **Processing Logic**:
@@ -129,9 +158,7 @@ process_live()
 
 ## Dependencies
 
-```bash
-pip install pandas polars requests gql flatten-json
-```
+Dependencies are managed via `pyproject.toml` and installed automatically with `uv sync`.
 
 **Key Libraries**:
 - `polars` - Fast DataFrame operations
@@ -139,6 +166,11 @@ pip install pandas polars requests gql flatten-json
 - `gql` - GraphQL client for Goldsky
 - `requests` - HTTP requests to Polymarket API
 - `flatten-json` - JSON flattening for nested responses
+
+**Development Dependencies** (optional, installed with `--extra dev`):
+- `jupyter` - Interactive notebooks
+- `notebook` - Jupyter notebook interface
+- `ipykernel` - Python kernel for Jupyter
 
 ## Features
 

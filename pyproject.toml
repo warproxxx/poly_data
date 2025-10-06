@@ -1,0 +1,35 @@
+[project]
+name = "poly-data"
+version = "0.1.0"
+description = "A comprehensive data pipeline for fetching, processing, and analyzing Polymarket trading data"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "Warproxxx", email = "" }
+]
+
+dependencies = [
+    "pandas>=2.0.0",
+    "polars>=0.19.0",
+    "requests>=2.31.0",
+    "gql[requests]>=3.4.0",
+    "flatten-json>=0.1.13",
+]
+
+[project.optional-dependencies]
+dev = [
+    "jupyter>=1.0.0",
+    "notebook>=7.0.0",
+    "ipykernel>=6.25.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["poly_utils", "update_utils"]
+
+[tool.uv]
+dev-dependencies = []
