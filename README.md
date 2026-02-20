@@ -4,7 +4,7 @@ A comprehensive data pipeline for fetching, processing, and analyzing Polymarket
 
 ## Quick Download
 
-**First-time users**: Download the [latest data snapshot](https://polydata-archive.s3.us-east-1.amazonaws.com/orderFilled_complete.csv.xz) (Credits to [@PendulumFlow](https://x.com/PendulumFlow) for fixing some missing points in the data and sending it over) and extract it in the main repository directory before your first run. This will save you over 2 days of initial data collection time.
+**First-time users**: Download the [latest data snapshot](https://polydata-archive.s3.us-east-1.amazonaws.com/orderFilled_complete.csv.xz) (Credits to [@PendulumFlow](https://x.com/PendulumFlow) for fixing some missing points in the data and sending it over) and extract it in the main repository directory before your first run [(backup if this doesn't work)](https://polydata-archive.s3.us-east-1.amazonaws.com/archive.tar.xz). This will save you over 2 days of initial data collection time.
 
 ## Overview
 
