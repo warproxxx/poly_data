@@ -108,7 +108,7 @@ def process_live():
     print("🔄 Processing Live Trades")
     print("=" * 60)
 
-    last_processed = {}
+    last_processed = None
 
     if os.path.exists(processed_file):
         print(f"✓ Found existing processed file: {processed_file}")
@@ -116,11 +116,13 @@ def process_live():
         last_line = result.stdout.strip()
         splitted = last_line.split(',')
 
-        last_processed['timestamp'] = pd.to_datetime(splitted[0])
-        last_processed['transactionHash'] = splitted[-1]
-        last_processed['maker'] = splitted[2]
-        last_processed['taker'] = splitted[3]
-        
+        last_processed = {
+            'timestamp': pd.to_datetime(splitted[0]),
+            'transactionHash': splitted[-1],
+            'maker': splitted[2],
+            'taker': splitted[3],
+        }
+
         print(f"📍 Resuming from: {last_processed['timestamp']}")
         print(f"   Last hash: {last_processed['transactionHash'][:16]}...")
     else:
@@ -142,13 +144,19 @@ def process_live():
 
     df = df.with_row_index()
 
-    same_timestamp = df.filter(pl.col('timestamp') == last_processed['timestamp'])
-    same_timestamp = same_timestamp.filter(
-        (pl.col("transactionHash") == last_processed['transactionHash']) & (pl.col("maker") == last_processed['maker']) & (pl.col("taker") == last_processed['taker'])
-    )
+    if last_processed is None:
+        df_process = df.drop('index')
+    else:
+        same_timestamp = df.filter(pl.col('timestamp') == last_processed['timestamp'])
+        same_timestamp = same_timestamp.filter(
+            (pl.col("transactionHash") == last_processed['transactionHash']) & (pl.col("maker") == last_processed['maker']) & (pl.col("taker") == last_processed['taker'])
+        )
 
-    df_process = df.filter(pl.col('index') > same_timestamp.row(0)[0])
-    df_process = df_process.drop('index')
+        if same_timestamp.is_empty():
+            print("⚠ Last processed row not found in source data; processing all rows")
+            df_process = df.drop('index')
+        else:
+            df_process = df.filter(pl.col('index') > same_timestamp.row(0)[0]).drop('index')
 
     print(f"⚙️  Processing {len(df_process):,} new rows...")
 
