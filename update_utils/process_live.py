@@ -142,13 +142,16 @@ def process_live():
 
     df = df.with_row_index()
 
-    same_timestamp = df.filter(pl.col('timestamp') == last_processed['timestamp'])
-    same_timestamp = same_timestamp.filter(
-        (pl.col("transactionHash") == last_processed['transactionHash']) & (pl.col("maker") == last_processed['maker']) & (pl.col("taker") == last_processed['taker'])
-    )
+    if last_processed:
+        same_timestamp = df.filter(pl.col('timestamp') == last_processed['timestamp'])
+        same_timestamp = same_timestamp.filter(
+            (pl.col("transactionHash") == last_processed['transactionHash']) & (pl.col("maker") == last_processed['maker']) & (pl.col("taker") == last_processed['taker'])
+        )
 
-    df_process = df.filter(pl.col('index') > same_timestamp.row(0)[0])
-    df_process = df_process.drop('index')
+        df_process = df.filter(pl.col('index') > same_timestamp.row(0)[0])
+        df_process = df_process.drop('index')
+    else:
+        df_process = df.drop('index')
 
     print(f"⚙️  Processing {len(df_process):,} new rows...")
 
