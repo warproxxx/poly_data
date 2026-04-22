@@ -16,10 +16,12 @@ def get_markets(main_file: str = "markets.csv", missing_file: str = "missing_mar
     """
     import polars as pl
     
-    # Schema overrides for long token IDs
+    # Schema overrides for long token IDs and hex condition/market ids
     schema_overrides = {
-        "token1": pl.Utf8,      # 76-digit ids → strings
-        "token2": pl.Utf8,
+        "token1":       pl.Utf8,   # 76-digit ids → strings
+        "token2":       pl.Utf8,
+        "id":           pl.Utf8,   # hex market ids like 0xcb9a...
+        "condition_id": pl.Utf8,   # hex condition ids
     }
     
     dfs = []
