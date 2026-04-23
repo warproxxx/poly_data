@@ -144,7 +144,7 @@ def scrape(at_once=1000):
                 '''
 
         query = gql(q_string)
-        transport = RequestsHTTPTransport(url=QUERY_URL, verify=True, retries=3)
+        transport = RequestsHTTPTransport(url=QUERY_URL, verify=True, retries=3, timeout=30)
         client = Client(transport=transport)
         
         try:
