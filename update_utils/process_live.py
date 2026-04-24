@@ -54,13 +54,6 @@ def get_processed_df(df):
         (pl.col("takerAmountFilled") / 10**6).alias("takerAmountFilled"),
     ])
 
-    df = df.with_columns(
-        pl.when(pl.col("takerAsset") == "USDC")
-        .then(pl.lit("BUY"))
-        .otherwise(pl.lit("SELL"))
-        .alias("taker_direction")
-    )
-
     df = df.with_columns([
         pl.when(pl.col("takerAsset") == "USDC")
         .then(pl.lit("BUY"))
