@@ -160,6 +160,39 @@ def process_live():
 
     print(f"⚙️  Processing {len(df_process):,} new rows...")
 
+    # Discover and fetch missing markets before processing
+    # Extract unique non-USDC asset IDs from trade data
+    import csv as csv_lib
+    maker_ids = set()
+    taker_ids = set()
+    with open("goldsky/orderFilled.csv", newline="", encoding="utf-8") as f:
+        reader = csv_lib.DictReader(f)
+        for row in reader:
+            if row.get("makerAssetId", "0") != "0":
+                maker_ids.add(row["makerAssetId"])
+            if row.get("takerAssetId", "0") != "0":
+                taker_ids.add(row["takerAssetId"])
+    trade_asset_ids = maker_ids | taker_ids
+
+    # Load existing markets to find which trade assets are missing
+    existing_ids = set()
+    for fname in ("markets.csv", "missing_markets.csv"):
+        if os.path.exists(fname):
+            with open(fname, newline="", encoding="utf-8") as f:
+                reader = csv_lib.DictReader(f)
+                for row in reader:
+                    if row.get("token1"):
+                        existing_ids.add(row["token1"])
+                    if row.get("token2"):
+                        existing_ids.add(row["token2"])
+    missing_ids = sorted(trade_asset_ids - existing_ids)
+
+    if missing_ids:
+        print(f"🔍 Found {len(missing_ids)} markets not in markets.csv — fetching from Polymarket API...")
+        update_missing_tokens(missing_ids)
+    else:
+        print("✅ All markets already present — no missing markets to fetch")
+
     new_df = get_processed_df(df_process)
     
     if not os.path.isdir('processed'):
