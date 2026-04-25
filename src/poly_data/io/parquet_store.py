@@ -107,9 +107,7 @@ class ParquetStore:
         if not partition_dir.is_dir():
             return 0
         existing = sorted(partition_dir.glob("*.parquet"))
-        if len(existing) <= 1 and (
-            len(existing) == 0 or existing[0].name == "month.parquet"
-        ):
+        if len(existing) <= 1:
             return 0
 
         lf = (

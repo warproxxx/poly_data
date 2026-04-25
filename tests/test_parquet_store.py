@@ -79,3 +79,33 @@ def test_cursor_lives_under_source_dir(store_root: Path) -> None:
     store = ParquetStore(store_root)
     store.save_cursor("trades", {"year": 2024, "month": 5, "last_id": "z"})
     assert (store_root / "trades" / "cursor.json").is_file()
+
+
+def test_compact_deduplicates_run_files(store_root: Path,
+                                        sample_orderfilled_df: pl.DataFrame) -> None:
+    store = ParquetStore(store_root)
+    jan = sample_orderfilled_df.filter(pl.col("id").is_in(["a1", "a2"]))
+    store.append("orderFilled", jan)
+    store.append("orderFilled", jan)
+
+    rows_before = store.scan("orderFilled").select(pl.len()).collect().item()
+    assert rows_before == 4
+
+    rewritten = store.compact("orderFilled", 2024, 1)
+    assert rewritten == 2
+
+    files = sorted((store_root / "orderFilled" / "year=2024" / "month=1").iterdir())
+    assert [f.name for f in files] == ["month.parquet"]
+
+
+def test_compact_noop_when_single_file(store_root: Path,
+                                       sample_orderfilled_df: pl.DataFrame) -> None:
+    store = ParquetStore(store_root)
+    store.append("orderFilled", sample_orderfilled_df.filter(pl.col("id") == "a1"))
+    rewritten = store.compact("orderFilled", 2024, 1)
+    assert rewritten == 0
+
+
+def test_compact_handles_missing_partition(store_root: Path) -> None:
+    store = ParquetStore(store_root)
+    assert store.compact("orderFilled", 2024, 1) == 0
