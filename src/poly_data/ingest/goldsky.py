@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Any, TypedDict
+from typing import TypedDict
 
 import polars as pl
 from gql import Client, gql

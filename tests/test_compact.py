@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import polars as pl
-import pytest
 
 from poly_data.io.parquet_store import ParquetStore
 from poly_data.compact.monthly import compact_all

@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 
-from poly_data.io.platform import last_line
+from poly_data.io.platform import atomic_write, last_line
 
 
 def test_last_line_returns_none_for_missing_file(tmp_path: Path) -> None:
@@ -64,9 +63,6 @@ def test_last_line_skips_trailing_blank_lines(tmp_path: Path) -> None:
     p = tmp_path / "blank.txt"
     p.write_bytes(b"a\nb\n\n\n")
     assert last_line(p) == "b"
-
-
-from poly_data.io.platform import atomic_write
 
 
 def test_atomic_write_creates_parent(tmp_path: Path) -> None:

@@ -4,7 +4,6 @@ import csv
 from pathlib import Path
 
 import polars as pl
-import pytest
 
 from scripts.migrate_csv_to_parquet import migrate
 

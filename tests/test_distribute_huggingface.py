@@ -4,7 +4,6 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import polars as pl
-import pytest
 
 from poly_data.io.parquet_store import ParquetStore
 from poly_data.distribute.huggingface import push_snapshot
