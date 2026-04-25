@@ -1,11 +1,10 @@
-from update_utils.update_markets import update_markets
-from update_utils.update_goldsky import update_goldsky
-from update_utils.process_live import process_live
+"""Backwards-compatible shim — delegates to poly_data.cli."""
+
+from __future__ import annotations
+
+import sys
+
+from poly_data.cli import main
 
 if __name__ == "__main__":
-    print("Updating markets")
-    update_markets()
-    print("Updating goldsky")
-    update_goldsky()
-    print("Processing live")
-    process_live()
+    sys.exit(main(["update-all", *sys.argv[1:]]))
