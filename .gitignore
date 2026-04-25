@@ -208,3 +208,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# v2 data lake
+data/
+legacy_csv/
+
+# macOS
+.DS_Store
