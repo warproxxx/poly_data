@@ -62,3 +62,20 @@ def test_append_requires_timestamp_column(store_root: Path) -> None:
     df = pl.DataFrame({"id": ["x"], "value": [1]})
     with pytest.raises(ValueError, match="timestamp"):
         store.append("orderFilled", df)
+
+
+def test_save_and_load_cursor(store_root: Path) -> None:
+    store = ParquetStore(store_root)
+    assert store.last_cursor("orderFilled") is None
+
+    store.save_cursor("orderFilled", {"last_timestamp": 1700000000, "last_id": "abc"})
+    assert store.last_cursor("orderFilled") == {
+        "last_timestamp": 1700000000,
+        "last_id": "abc",
+    }
+
+
+def test_cursor_lives_under_source_dir(store_root: Path) -> None:
+    store = ParquetStore(store_root)
+    store.save_cursor("trades", {"year": 2024, "month": 5, "last_id": "z"})
+    assert (store_root / "trades" / "cursor.json").is_file()
