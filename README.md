@@ -1,6 +1,27 @@
 # Polymarket Data
 
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](https://opensource.org/licenses/GPL-3.0)
+[![GitHub stars](https://img.shields.io/github/stars/warproxxx/poly_data)](https://github.com/warproxxx/poly_data/stargazers)
+[![GitHub last commit](https://img.shields.io/github/last-commit/warproxxx/poly_data)](https://github.com/warproxxx/poly_data/commits/main)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+
 A comprehensive data pipeline for fetching, processing, and analyzing Polymarket trading data. This system collects market information, order-filled events, and processes them into structured trade data.
+
+## Table of Contents
+
+- [Quick Download](#quick-download)
+- [Overview](#overview)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Project Structure](#project-structure)
+- [Data Files](#data-files)
+- [Pipeline Stages](#pipeline-stages)
+- [Dependencies](#dependencies)
+- [Features](#features)
+- [Data Schema Details](#data-schema-details)
+- [Analysis](#analysis)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
 
 ## Quick Download
 
