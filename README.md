@@ -275,7 +275,3 @@ USERS = {
 # Get all trades for a specific user
 trader_df = df.filter((pl.col("maker") == USERS['domah']))
 ```
-
-## License
-
-Go wild with it
