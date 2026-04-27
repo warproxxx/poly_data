@@ -17,7 +17,7 @@ API_URL = "https://gamma-api.polymarket.com/markets"
 MARKET_COLUMNS = [
     "createdAt", "id", "question", "answer1", "answer2", "neg_risk",
     "market_slug", "token1", "token2", "condition_id", "volume", "ticker",
-    "closedTime", "timestamp",
+    "closedTime", "timestamp", "category",
 ]
 
 
@@ -45,9 +45,12 @@ def _parse_market(market: dict[str, Any]) -> dict[str, Any] | None:
             market.get("negRiskAugmented") or market.get("negRiskOther")
         )
         ticker = ""
+        category = str(market.get("category", "") or "")
         events = market.get("events") or []
         if events:
             ticker = events[0].get("ticker", "")
+            if not category:
+                category = str(events[0].get("category", "") or "")
 
         created_at = market.get("createdAt", "")
         ts_int = _to_unix_seconds(created_at)
@@ -66,6 +69,7 @@ def _parse_market(market: dict[str, Any]) -> dict[str, Any] | None:
             "ticker": str(ticker),
             "closedTime": str(market.get("closedTime", "")),
             "timestamp": ts_int,
+            "category": category,
         }
     except (ValueError, KeyError, json.JSONDecodeError, TypeError) as e:
         logger.warning("market parse failed for id=%s: %s",
