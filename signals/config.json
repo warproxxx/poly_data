@@ -1,0 +1,10 @@
+{
+  "whale_threshold_usd": 50000,
+  "volume_spike_multiplier": 3.0,
+  "lookback_minutes": 60,
+  "scan_window_minutes": 15,
+  "btc_markets_file": "btc_price_markets.csv",
+  "min_spike_volume_usd": 1000,
+  "telegram_bot_token": "",
+  "telegram_chat_id": ""
+}
