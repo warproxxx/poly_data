@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gc
-import threading
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -9,6 +8,8 @@ from typing import Iterator
 
 import polars as pl
 import psutil
+
+from poly_data.analysis._sampling import SAMPLER
 
 
 @dataclass
@@ -31,31 +32,24 @@ class Bench:
         gc.collect()
         time.sleep(0.05)
         baseline = proc.memory_info().rss
-        # Synchronous pre-sample so queries that finish faster than
-        # `sample_ms` still record a non-zero peak (the daemon may
-        # never tick for sub-50ms cells).
+        # Synchronous pre-sample so queries that finish faster than the shared
+        # sampler's tick still record a non-zero peak.
         peak = max(baseline, proc.memory_info().rss)
-        stop = threading.Event()
 
-        def sampler() -> None:
+        def listener(rss: int) -> None:
             nonlocal peak
-            while not stop.is_set():
-                rss = proc.memory_info().rss
-                if rss > peak:
-                    peak = rss
-                stop.wait(0.05)
+            if rss > peak:
+                peak = rss
 
-        t = threading.Thread(target=sampler, daemon=True)
-        t.start()
+        listener_id = SAMPLER.register(listener)
         t0 = time.perf_counter()
         try:
             yield out
         finally:
             elapsed = time.perf_counter() - t0
-            stop.set()
-            t.join(timeout=1.0)
+            SAMPLER.deregister(listener_id)
             # Final synchronous sample — covers the case where the worker
-            # finished after the last sampler tick but before stop.set().
+            # finished between the last sampler tick and deregister().
             rss_final = proc.memory_info().rss
             if rss_final > peak:
                 peak = rss_final

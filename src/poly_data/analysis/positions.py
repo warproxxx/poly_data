@@ -179,6 +179,10 @@ def player_aggregates(labelled_positions: pl.DataFrame) -> pl.DataFrame:
             pl.col("pnl_usd").sum().alias("net_usd_pnl"),
         )
     )
+    # Two sequential `with_columns` blocks: the second references `win_rate`
+    # produced by the first. Polars 1.40 evaluates expressions inside one
+    # `with_columns` against the *original* frame, so forward references raise
+    # ColumnNotFoundError — keep the chain.
     return grp.with_columns([
         (pl.col("n_won") + pl.col("n_lost")).alias("n_bets"),
         (pl.col("n_won") /
