@@ -74,7 +74,7 @@ def positions_table(trades: pl.LazyFrame, *,
             pl.col("timestamp").min().alias("first_ts"),
             pl.col("timestamp").max().alias("last_ts"),
         )
-        .collect()
+        .collect(engine="streaming")
     )
 
 
@@ -82,10 +82,13 @@ def market_resolution(trades: pl.LazyFrame, *,
                       win_threshold: float = 0.98) -> pl.DataFrame:
     """One row per market: market_id, token1, token2 (last prices), winner_token."""
     last_per_side = (
-        trades.sort("timestamp")
+        trades
         .group_by(["market_id", "nonusdc_side"])
-        .agg(pl.col("price").last().alias("last_price"))
-        .collect()
+        .agg(
+            pl.col("price").gather(pl.col("timestamp").arg_max())
+            .first().alias("last_price")
+        )
+        .collect(engine="streaming")
     )
     pivoted = last_per_side.pivot(
         index="market_id", on="nonusdc_side", values="last_price"
@@ -170,10 +173,13 @@ def compute_player_stats(trades: pl.LazyFrame, *,
     res = market_resolution(trades, win_threshold=win_threshold)
     pos = positions_table(trades, player_side=player_side)
     last = (
-        trades.sort("timestamp")
+        trades
         .group_by(["market_id", "nonusdc_side"])
-        .agg(pl.col("price").last().alias("last_price"))
-        .collect()
+        .agg(
+            pl.col("price").gather(pl.col("timestamp").arg_max())
+            .first().alias("last_price")
+        )
+        .collect(engine="streaming")
         .rename({"nonusdc_side": "token_side"})
     )
     labelled = label_outcomes(pos, res, last_prices=last)

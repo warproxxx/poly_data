@@ -9,6 +9,31 @@ from poly_data.io.parquet_store import ParquetStore
 logger = logging.getLogger(__name__)
 
 
+def _scan_orderfilled_partition(
+    store: ParquetStore, year: int, month: int
+) -> pl.LazyFrame | None:
+    """Scan one (year, month) partition tolerating mixed column types across files.
+
+    Some historical files store `makerAmountFilled` / `takerAmountFilled` as Int64,
+    newer ones as String. Read each file lazily, cast both to String (final
+    Float64 cast happens in `_transform`), then concat.
+    """
+    partition_dir = store.root / "orderFilled" / f"year={year}" / f"month={month}"
+    if not partition_dir.is_dir():
+        return None
+    files = sorted(partition_dir.glob("*.parquet"))
+    if not files:
+        return None
+    parts = []
+    for f in files:
+        lf = pl.scan_parquet(str(f), hive_partitioning=True).with_columns([
+            pl.col("makerAmountFilled").cast(pl.String),
+            pl.col("takerAmountFilled").cast(pl.String),
+        ])
+        parts.append(lf)
+    return pl.concat(parts, how="diagonal_relaxed")
+
+
 def _list_partitions(store: ParquetStore, source: str) -> list[tuple[int, int]]:
     base = store.root / source
     if not base.is_dir():
@@ -116,7 +141,9 @@ def process_trades(store: ParquetStore) -> int:
         if cur_year is not None and (year, month) < (cur_year, cur_month):
             continue
 
-        orders_lf = store.scan("orderFilled", year=year, month=month)
+        orders_lf = _scan_orderfilled_partition(store, year, month)
+        if orders_lf is None:
+            continue
         if cur_year is not None and (year, month) == (cur_year, cur_month) \
                 and last_id is not None:
             orders_lf = orders_lf.filter(pl.col("id") > last_id)

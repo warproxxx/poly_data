@@ -211,6 +211,9 @@ __marimo__/
 
 # v2 data lake
 data/
+data_smoke/
+_nb05_smoke.log
+_duckdb_tmp/
 legacy_csv/
 
 # macOS
