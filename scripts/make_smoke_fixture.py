@@ -65,6 +65,12 @@ def main() -> None:
     sample_tokens = set(sample["token1"].to_list()) | set(sample["token2"].to_list())
     print(f"sampled markets: {sample.height}; tokens: {len(sample_tokens)}")
 
+    # Markets are not naturally partitioned by month in production (markets are
+    # created/closed across time and the ingest stores them under whichever
+    # year/month the row's `timestamp` field happens to fall on). The fixture
+    # deliberately collapses all sampled markets into a single
+    # ``year=<args.year>/month=<args.months[-1]>`` directory; downstream readers
+    # use ``data_root/markets/**/*.parquet`` glob, so the path is irrelevant.
     dst.mkdir(parents=True, exist_ok=True)
     out_markets = dst / "markets" / f"year={args.year}" / f"month={args.months[-1]}"
     out_markets.mkdir(parents=True, exist_ok=True)

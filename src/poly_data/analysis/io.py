@@ -17,7 +17,20 @@ DEFAULT_CAP_MB = 2048
 @contextmanager
 def rss_guard(label: str, *, cap_mb: int = DEFAULT_CAP_MB,
               sample_ms: int = 50) -> Iterator[None]:
-    """Background-poll process RSS; raise MemoryError on exit if cap_mb exceeded above baseline."""
+    """Postmortem RSS audit. Raises MemoryError on exit if cap_mb was exceeded above baseline.
+
+    **Important**: this is a *postmortem detector*, not a circuit breaker. A
+    background daemon thread polls process RSS every ``sample_ms`` ms; if it sees
+    cap_mb breached, it records the breach but cannot interrupt the running
+    polars/duckdb query (no thread-cancel API in either engine). The
+    ``MemoryError`` raises only after the guarded block completes — by which
+    time the OS may already have OOM-killed the process. Use it to *detect*
+    excessive allocations after the fact, not to *prevent* them.
+
+    For real prevention, push the constraint into the engines themselves:
+    ``open_duckdb(memory_limit='2GB')`` for DuckDB, query restructuring (avoid
+    non-partitionable group-bys) for Polars.
+    """
     proc = psutil.Process()
     gc.collect()
     baseline = proc.memory_info().rss

@@ -21,6 +21,13 @@ class DatasetSplit:
 
 def load(category: str, *, window_days: int, horizon_days: int,
          data_root: Path | str = Path("data/ml")) -> DatasetSplit:
+    """Load a saved ML split eagerly into numpy arrays.
+
+    Eager `pl.read_parquet` is intentional here: the dataset is bounded by
+    ``top_n_players`` × ``decision_dates`` × ``markets-in-category`` (typically
+    < 100k rows in practice), and downstream consumers (sklearn / xgboost)
+    require numpy arrays anyway.
+    """
     root = Path(data_root) / category / f"window={window_days}d" \
                             / f"horizon={horizon_days}d"
     if not root.is_dir():

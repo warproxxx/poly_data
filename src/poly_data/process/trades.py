@@ -9,14 +9,24 @@ from poly_data.io.parquet_store import ParquetStore
 logger = logging.getLogger(__name__)
 
 
+_AMOUNT_COLS = ("makerAmountFilled", "takerAmountFilled")
+
+
 def _scan_orderfilled_partition(
     store: ParquetStore, year: int, month: int
 ) -> pl.LazyFrame | None:
     """Scan one (year, month) partition tolerating mixed column types across files.
 
-    Some historical files store `makerAmountFilled` / `takerAmountFilled` as Int64,
-    newer ones as String. Read each file lazily, cast both to String (final
-    Float64 cast happens in `_transform`), then concat.
+    Forced per-file scan: ``pl.scan_parquet([f1, f2, ...])`` rejects mixed dtypes
+    on the same logical column with a ``SchemaMismatch`` error, so we cannot use
+    the multi-file form here. Some historical files store ``makerAmountFilled``
+    / ``takerAmountFilled`` as Int64 and newer ones as String, and the column
+    order varies across runs — hence ``how="diagonal_relaxed"`` for the concat.
+    Both amount columns are cast to String here; the final Float64 cast happens
+    in ``_transform``.
+
+    Returns ``None`` if the partition directory is missing, empty, or no file
+    has both amount columns (defensive: yields an opaque polars error otherwise).
     """
     partition_dir = store.root / "orderFilled" / f"year={year}" / f"month={month}"
     if not partition_dir.is_dir():
@@ -26,11 +36,20 @@ def _scan_orderfilled_partition(
         return None
     parts = []
     for f in files:
-        lf = pl.scan_parquet(str(f), hive_partitioning=True).with_columns([
+        head = pl.scan_parquet(str(f), hive_partitioning=True)
+        cols = head.collect_schema().names()
+        if not all(c in cols for c in _AMOUNT_COLS):
+            logger.warning(
+                "skipping %s: missing amount columns (have=%s)", f, cols
+            )
+            continue
+        lf = head.with_columns([
             pl.col("makerAmountFilled").cast(pl.String),
             pl.col("takerAmountFilled").cast(pl.String),
         ])
         parts.append(lf)
+    if not parts:
+        return None
     return pl.concat(parts, how="diagonal_relaxed")
 
 

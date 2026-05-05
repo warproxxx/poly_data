@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import logging
 import math
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import numpy as np
 import polars as pl
 
 from poly_data.analysis.positions import market_resolution
+
+logger = logging.getLogger(__name__)
 
 FEATURE_NAMES: list[str] = [
     "n_players_active",
@@ -26,7 +30,8 @@ def _parse_iso_to_unix(s: str) -> int:
     try:
         return int(datetime.fromisoformat(s.replace("Z", "+00:00"))
                    .astimezone(timezone.utc).timestamp())
-    except Exception:
+    except (ValueError, TypeError) as e:
+        logger.warning("malformed ISO timestamp %r: %s; treating as 0 (epoch)", s, e)
         return 0
 
 
@@ -55,7 +60,14 @@ def _empty_features_df() -> pl.DataFrame:
 
 def _features_for_window(window_trades: pl.DataFrame,
                          player_set: set[str]) -> pl.DataFrame:
-    """Per-market panel features for one decision window."""
+    """Per-market panel features for one decision window.
+
+    Activity counting handles double-panel-member fills (both maker AND taker
+    in the panel) by emitting one row per active side, so ``n_players_active``
+    counts both. The market-level aggregates (mean prices, USD volumes, buy/sell
+    counts, last_price) come from the original (un-duplicated) ``df`` to avoid
+    double-counting trade volume.
+    """
     if window_trades.height == 0:
         return _empty_features_df()
 
@@ -71,7 +83,7 @@ def _features_for_window(window_trades: pl.DataFrame,
     if df.height == 0:
         return _empty_features_df()
 
-    df = df.with_columns([
+    df = df.with_columns(
         pl.when((pl.col("nonusdc_side") == "token1")
                 & (pl.col("maker_direction") == "BUY"))
           .then(pl.col("token_amount"))
@@ -80,14 +92,21 @@ def _features_for_window(window_trades: pl.DataFrame,
           .then(-pl.col("token_amount"))
         .otherwise(0.0)
         .alias("signed_t1"),
-        pl.when(pl.col("maker_active")).then(pl.col("maker"))
-          .when(pl.col("taker_active")).then(pl.col("taker"))
-          .otherwise(None)
-          .alias("active_player"),
-    ])
+    )
+
+    # Per-(active_player) projection: one row per active side. A fill where
+    # both maker and taker are panel members produces two rows, one per side.
+    maker_rows = (df.filter(pl.col("maker_active"))
+                    .with_columns(pl.col("maker").alias("active_player")))
+    taker_rows = (df.filter(pl.col("taker_active"))
+                    .with_columns(pl.col("taker").alias("active_player")))
+    by_player = pl.concat([maker_rows, taker_rows])
+
+    n_active = by_player.group_by("market_id").agg(
+        pl.col("active_player").n_unique().alias("n_players_active")
+    )
 
     by_market = df.group_by("market_id").agg([
-        pl.col("active_player").n_unique().alias("n_players_active"),
         pl.col("price").filter(
             (pl.col("nonusdc_side") == "token1") & (pl.col("maker_direction") == "BUY")
         ).mean().alias("mean_buy_price_t1"),
@@ -120,9 +139,9 @@ def _features_for_window(window_trades: pl.DataFrame,
     ])
 
     per_player_t1 = (
-        df.filter(pl.col("nonusdc_side") == "token1")
-          .group_by(["market_id", "active_player"])
-          .agg(pl.col("signed_t1").sum().alias("net"))
+        by_player.filter(pl.col("nonusdc_side") == "token1")
+                 .group_by(["market_id", "active_player"])
+                 .agg(pl.col("signed_t1").sum().alias("net"))
     )
     consensus = (
         per_player_t1.group_by("market_id")
@@ -131,7 +150,8 @@ def _features_for_window(window_trades: pl.DataFrame,
              pl.len().cast(pl.Float64)).alias("consensus_score")
         )
     )
-    out = by_market.join(consensus, on="market_id", how="left")
+    out = by_market.join(n_active, on="market_id", how="left") \
+                   .join(consensus, on="market_id", how="left")
     if "consensus_score" not in out.columns:
         out = out.with_columns(pl.lit(None, dtype=pl.Float64).alias("consensus_score"))
     return out
@@ -174,6 +194,15 @@ def build_dataset(
     window_secs = window_days * 86400
     decision_dates = _decision_date_grid(min_ts + window_secs,
                                          max_ts - horizon_secs)
+    if not decision_dates:
+        span_days = (max_ts - min_ts) / 86400
+        logger.warning(
+            "build_dataset: data spans %.1f days but window=%dd + horizon=%dd "
+            "needs > %dd; returning empty result",
+            span_days, window_days, horizon_days, window_days + horizon_days,
+        )
+        return _empty_result(category, window_days, horizon_days,
+                             min_active_frac, n_players)
 
     winners = market_resolution(trades)
     closed_lookup = (
@@ -186,12 +215,17 @@ def build_dataset(
     )
 
     threshold = math.ceil(min_active_frac * n_players)
+    # Sort once + binary-search slices, instead of N full-scan filters.
+    # Per-window cost drops from O(n) to O(log n + window_size).
+    filtered = filtered.sort("timestamp")
+    ts_array = filtered["timestamp"].to_numpy()
     rows: list[pl.DataFrame] = []
     for d_ts in decision_dates:
-        slice_ = filtered.filter(
-            (pl.col("timestamp") >= d_ts - window_secs)
-            & (pl.col("timestamp") < d_ts)
-        )
+        lo = int(np.searchsorted(ts_array, d_ts - window_secs, side="left"))
+        hi = int(np.searchsorted(ts_array, d_ts, side="left"))
+        if hi <= lo:
+            continue
+        slice_ = filtered.slice(lo, hi - lo)
         feat = _features_for_window(slice_, player_ids)
         if feat.height == 0:
             continue
