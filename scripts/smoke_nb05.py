@@ -1,27 +1,37 @@
 """Smoke-run examples/05-ml-dataset-and-baseline.ipynb via nbclient.
 
-Requires:
-- `python update_all.py` has populated `data/trades/` and `data/markets/`.
-- `pip install -e .[analysis,dev]` (xgboost + scikit-learn required).
+Runs the notebook against ``data_smoke/`` (a tiny self-consistent fixture built
+by ``scripts/make_smoke_fixture.py``).
 
-Usage: python scripts/smoke_nb05.py
+Usage:
+    python scripts/make_smoke_fixture.py     # one-time setup
+    python scripts/smoke_nb05.py
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import nbformat
 from nbclient import NotebookClient
 
-NB = Path(__file__).resolve().parents[1] / "examples" \
-                  / "05-ml-dataset-and-baseline.ipynb"
+ROOT = Path(__file__).resolve().parents[1]
+NB = ROOT / "examples" / "05-ml-dataset-and-baseline.ipynb"
 
 
 def main() -> None:
+    smoke_root = ROOT / "data_smoke"
+    if not (smoke_root / "trades").is_dir():
+        raise SystemExit(
+            f"smoke fixture missing at {smoke_root}; "
+            "run `python scripts/make_smoke_fixture.py` first"
+        )
+    os.environ["POLY_DATA_ROOT"] = smoke_root.as_posix()
+
     nb = nbformat.read(NB, as_version=4)
     NotebookClient(
         nb,
-        timeout=1800,
+        timeout=300,
         resources={"metadata": {"path": NB.parent}},
     ).execute()
     print("nb05 smoke OK")
