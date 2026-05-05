@@ -54,7 +54,9 @@ class GoldskyScraper:
         self.batch_size = batch_size
         self.sticky_threshold = sticky_threshold
 
-        transport = RequestsHTTPTransport(url=project_url, verify=True, retries=3)
+        transport = RequestsHTTPTransport(
+            url=project_url, verify=True, retries=3, timeout=30,
+        )
         self._client = Client(transport=transport)
 
     def fetch_range(

@@ -8,11 +8,13 @@ from pathlib import Path
 from poly_data.compact.monthly import compact_all
 from poly_data.distribute.huggingface import push_snapshot
 from poly_data.ingest.goldsky import GoldskyScraper
-from poly_data.ingest.markets import update_markets
+from poly_data.ingest.markets import update_markets, update_missing_tokens
 from poly_data.ingest.parallel import run_segments
 from poly_data.io.parquet_store import ParquetStore
 from poly_data.logging_setup import configure_logging
-from poly_data.process.trades import process_trades
+from poly_data.process.trades import (
+    _scan_orderfilled_partition, _list_partitions, process_trades,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,41 @@ GOLDSKY_URL = (
 def _scraper_fetch_incremental(scraper: GoldskyScraper) -> int:
     """Indirection for easier mocking in tests."""
     return scraper.fetch_incremental()
+
+
+def _discover_and_fetch_missing_tokens(store: ParquetStore) -> int:
+    """Scan orderFilled for asset IDs absent from markets/missing_markets, fetch them.
+
+    Ports the upstream fix (commit 58dbd02) that addresses the case where trades
+    reference token IDs the markets ingest never observed — the join produces
+    null market_id and downstream analysis sees no decided positions. Run this
+    between goldsky scrape and process_trades.
+    """
+    asset_ids: set[str] = set()
+    for (year, month) in _list_partitions(store, "orderFilled"):
+        lf = _scan_orderfilled_partition(store, year, month)
+        if lf is None:
+            continue
+        df = lf.select(["makerAssetId", "takerAssetId"]).collect()
+        asset_ids |= set(df["makerAssetId"].to_list())
+        asset_ids |= set(df["takerAssetId"].to_list())
+    asset_ids.discard("0")
+
+    known: set[str] = set()
+    for source in ("markets", "missing_markets"):
+        try:
+            tokens = store.scan(source).select(["token1", "token2"]).collect()
+        except Exception:
+            continue
+        if tokens.height == 0:
+            continue
+        known |= set(tokens["token1"].to_list())
+        known |= set(tokens["token2"].to_list())
+    missing = sorted(asset_ids - known)
+    if not missing:
+        return 0
+    logger.info("discover_missing_tokens: %d ids to fetch", len(missing))
+    return update_missing_tokens(store, missing)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -122,6 +159,9 @@ def main(argv: list[str] | None = None) -> int:
             event_type="orderFilled", store=store, project_url=GOLDSKY_URL
         )
         _scraper_fetch_incremental(scraper)
+        n_missing = _discover_and_fetch_missing_tokens(store)
+        if n_missing:
+            logger.info("update-all: fetched %d missing markets", n_missing)
         process_trades(store)
         return 0
 
