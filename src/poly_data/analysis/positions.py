@@ -78,19 +78,36 @@ def positions_table(trades: pl.LazyFrame, *,
     )
 
 
-def market_resolution(trades: pl.LazyFrame, *,
-                      win_threshold: float = 0.98) -> pl.DataFrame:
-    """One row per market: market_id, token1, token2 (last prices), winner_token."""
-    last_per_side = (
+def _last_price_per_side(trades: pl.LazyFrame) -> pl.LazyFrame:
+    """Lazy: one row per (market_id, nonusdc_side) with chronologically last price.
+
+    Uses max-timestamp anti-join instead of `gather(arg_max)` because the latter
+    is not partitionable in the polars-stream engine and silently falls back to
+    a single in-memory hash table that materialises the full price column per
+    group — ~2.4 GB on 50M trades. Both group-by passes here ARE partitionable,
+    so `.collect(engine="streaming")` actually streams.
+    """
+    max_ts = (
         trades
         .group_by(["market_id", "nonusdc_side"])
-        .agg(
-            pl.col("price").gather(pl.col("timestamp").arg_max())
-            .first().alias("last_price")
-        )
-        .collect(engine="streaming")
+        .agg(pl.col("timestamp").max().alias("_mt"))
     )
-    pivoted = last_per_side.pivot(
+    return (
+        trades
+        .join(
+            max_ts,
+            left_on=["market_id", "nonusdc_side", "timestamp"],
+            right_on=["market_id", "nonusdc_side", "_mt"],
+            how="inner",
+        )
+        .group_by(["market_id", "nonusdc_side"])
+        .agg(pl.col("price").first().alias("last_price"))
+    )
+
+
+def _resolution_from_last(last: pl.DataFrame, *,
+                          win_threshold: float) -> pl.DataFrame:
+    pivoted = last.pivot(
         index="market_id", on="nonusdc_side", values="last_price"
     )
     if "token1" not in pivoted.columns:
@@ -103,6 +120,13 @@ def market_resolution(trades: pl.LazyFrame, *,
         .otherwise(pl.lit("open"))
         .alias("winner_token")
     ])
+
+
+def market_resolution(trades: pl.LazyFrame, *,
+                      win_threshold: float = 0.98) -> pl.DataFrame:
+    """One row per market: market_id, token1, token2 (last prices), winner_token."""
+    last = _last_price_per_side(trades).collect(engine="streaming")
+    return _resolution_from_last(last, win_threshold=win_threshold)
 
 
 def label_outcomes(positions: pl.DataFrame,
@@ -170,17 +194,9 @@ def player_aggregates(labelled_positions: pl.DataFrame) -> pl.DataFrame:
 def compute_player_stats(trades: pl.LazyFrame, *,
                          player_side: PlayerSide = "both",
                          win_threshold: float = 0.98) -> pl.DataFrame:
-    res = market_resolution(trades, win_threshold=win_threshold)
+    last = _last_price_per_side(trades).collect(engine="streaming")
+    res = _resolution_from_last(last, win_threshold=win_threshold)
     pos = positions_table(trades, player_side=player_side)
-    last = (
-        trades
-        .group_by(["market_id", "nonusdc_side"])
-        .agg(
-            pl.col("price").gather(pl.col("timestamp").arg_max())
-            .first().alias("last_price")
-        )
-        .collect(engine="streaming")
-        .rename({"nonusdc_side": "token_side"})
-    )
-    labelled = label_outcomes(pos, res, last_prices=last)
+    last_for_join = last.rename({"nonusdc_side": "token_side"})
+    labelled = label_outcomes(pos, res, last_prices=last_for_join)
     return player_aggregates(labelled)
