@@ -42,6 +42,12 @@ OUTPUT_DIR = "data"
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "orderFilled.csv")
 CURSOR_FILE = os.path.join(OUTPUT_DIR, "cursor_state.json")
 
+# Blocks per eth_getLogs call. Auto-halves on errors, so a higher default
+# is safe — wins on sparse windows, falls back on busy ones.
+BLOCK_RANGE = 1000
+# Reorg-safety buffer for Polygon.
+CONFIRMATIONS = 20
+
 COLUMNS = [
     "timestamp",
     "maker",
@@ -58,17 +64,6 @@ DEFAULT_RPC = "https://polygon-bor-rpc.publicnode.com"
 
 def _rpc_url() -> str:
     return os.environ.get("POLYGON_RPC_URL", DEFAULT_RPC)
-
-
-def _block_range() -> int:
-    # 500 is conservative: the V2 contract is very active (often >200 events/block),
-    # and most providers return-size-cap before they range-cap. Auto-halves on errors.
-    # Bump POLYGON_BLOCK_RANGE on a paid plan with bigger response limits.
-    return int(os.environ.get("POLYGON_BLOCK_RANGE", "500"))
-
-
-def _confirmations() -> int:
-    return int(os.environ.get("POLYGON_CONFIRMATIONS", "20"))
 
 
 def _load_cursor() -> int:
@@ -165,11 +160,11 @@ def update_chain() -> None:
         raise RuntimeError(f"Cannot connect to Polygon RPC: {rpc}")
 
     latest = w3.eth.block_number
-    safe_latest = latest - _confirmations()
+    safe_latest = latest - CONFIRMATIONS
     start_block = _load_cursor()
 
     print(f"RPC: {rpc}")
-    print(f"Latest block: {latest:,}  (safe: {safe_latest:,} after {_confirmations()} confs)")
+    print(f"Latest block: {latest:,}  (safe: {safe_latest:,} after {CONFIRMATIONS} confs)")
     print(f"Resuming from block {start_block:,}")
 
     if start_block > safe_latest:
@@ -181,13 +176,12 @@ def update_chain() -> None:
         with open(OUTPUT_FILE, "w", newline="") as f:
             csv.writer(f).writerow(COLUMNS)
 
-    block_range = _block_range()
     cur = start_block
     total = 0
     ts_cache: dict = {}
 
     while cur <= safe_latest:
-        end = min(cur + block_range - 1, safe_latest)
+        end = min(cur + BLOCK_RANGE - 1, safe_latest)
         logs, end = _get_logs_with_backoff(w3, cur, end)
 
         if logs:

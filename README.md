@@ -13,6 +13,22 @@ Polymarket migrated to a new set of CTF Exchange contracts on **2026-04-28** and
 
 The previous version is preserved at the [`v1-final`](https://github.com/warproxxx/poly_data/tree/v1-final) tag if you need it for historical analysis. **For any new work, use this v2 version.**
 
+## Configuration
+
+All tuning is via environment variables. 
+
+| Variable | Default | What it does |
+|---|---|---|
+| `POLYGON_RPC_URL` | `https://polygon-bor-rpc.publicnode.com` | Polygon JSON-RPC endpoint. Public default works but is slow and times out under sustained backfill. Free tier of [QuickNode](https://quicknode.com/signup?via=daniel-s) or [Chainstack](https://chainstack.com) is much more reliable. Paid tier recommended if you're doing it in a serious environment. |
+| `PROCESS_CHUNK_SIZE` | `0` | When `>0`, streams `data/orderFilled.csv` through chunks if your machine has limitations processing the data. Use `500000` if processing OOMs on your machine. |
+
+Set them in `.env` file:
+
+```bash
+export POLYGON_RPC_URL="https://your-endpoint-here"
+export PROCESS_CHUNK_SIZE=500000   # only if RAM is tight
+```
+
 ## Table of Contents
 
 - [Overview](#overview)
@@ -150,21 +166,13 @@ Outputs `markets_closed_part.csv` + `markets_active_part.csv` (kept across runs 
 
 ### 2. `update_chain` — Polygon RPC `OrderFilled` events
 
-Calls `eth_getLogs` on the CTF Exchange V2 contract in windows of `POLYGON_BLOCK_RANGE` (default 500). Decodes events with the ABI, looks up block timestamps (cached per chunk), and appends to `data/orderFilled.csv`. Saves the last scanned block to `data/cursor_state.json`.
-
-**Environment variables:**
-- `POLYGON_RPC_URL` — HTTPS endpoint (default: `polygon-bor-rpc.publicnode.com`)
-- `POLYGON_BLOCK_RANGE` — blocks per `getLogs` call (default: `500`; auto-halves on errors)
-- `POLYGON_CONFIRMATIONS` — block confirmations to wait for reorg safety (default: `20`)
+Calls `eth_getLogs` on the CTF Exchange V2 contract in 1000-block windows (auto-halves on errors). Decodes events with the ABI, looks up block timestamps (cached per chunk), and appends to `data/orderFilled.csv`. Saves the last scanned block to `data/cursor_state.json`.
 
 ### 3. `process_live`
 
 Reads `data/orderFilled.csv`, finds the resume point in `processed/trades.csv`, joins new orders against `get_markets()` (which parses `clobTokenIds` into `token1`/`token2`), computes price/USD/direction, and appends to `processed/trades.csv`.
 
-If any trade references a token ID not in `markets.csv`, it's backfilled into `missing_markets.csv` via a per-token Gamma API call before the join.
-
-**Environment variables:**
-- `PROCESS_CHUNK_SIZE` — when set to a positive integer (e.g. `500000`), the orders CSV is streamed in chunks of that many rows instead of loaded all at once. Use this if `orderFilled.csv` is large enough to strain memory. Default: `0` (no chunking, single-pass load).
+If any trade references a token ID not in `markets.csv`, it's backfilled into `missing_markets.csv` via a per-token Gamma API call before the join. For memory-bounded processing on large datasets, set `PROCESS_CHUNK_SIZE` — see [Configuration](#configuration).
 
 ## Analysis
 
