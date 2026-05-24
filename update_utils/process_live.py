@@ -19,10 +19,15 @@ import polars as pl
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from poly_utils.utils import get_markets, update_missing_tokens
+from poly_utils.utils import get_lean_markets, update_missing_tokens
 
 ORDERS_CSV = "data/orderFilled.csv"
 TRADES_CSV = "processed/trades.csv"
+
+# Chunk size for streaming the orders CSV through the join.
+# Default 0 = chunking disabled (load everything in one pass).
+# Set e.g. PROCESS_CHUNK_SIZE=500000 to bound memory on large orderFilled.csv files.
+CHUNK_SIZE = int(os.environ.get("PROCESS_CHUNK_SIZE", "0"))
 
 
 def _processed_df(df: pl.DataFrame, markets_df: pl.DataFrame) -> pl.DataFrame:
@@ -184,6 +189,46 @@ def _discover_missing_tokens(markets_df: pl.DataFrame) -> None:
         print("✅ All markets present")
 
 
+def _match_marker(chunk: pl.DataFrame, last: dict) -> int | None:
+    """Return the row index in `chunk` matching the last-processed marker, or None."""
+    mask = chunk.with_row_index().filter(
+        (pl.col("timestamp") == last["timestamp"])
+        & (pl.col("transactionHash") == last["transactionHash"])
+        & (pl.col("maker") == last["maker"])
+        & (pl.col("taker") == last["taker"])
+    )
+    if mask.is_empty():
+        return None
+    return int(mask.row(0)[0])
+
+
+def _accumulate(reader, target_rows: int):
+    """Pull batches from the polars batched reader until we have at least
+    `target_rows` rows, or the reader is exhausted. polars's batch_size is
+    an I/O hint, not a row count — without this we get hundreds of tiny
+    chunks and pay the join setup cost repeatedly.
+    """
+    parts: list = []
+    rows = 0
+    while rows < target_rows:
+        batches = reader.next_batches(1)
+        if not batches:
+            break
+        parts.append(batches[0])
+        rows += len(batches[0])
+    if not parts:
+        return None
+    return parts[0] if len(parts) == 1 else pl.concat(parts)
+
+
+def _write_chunk(trades: pl.DataFrame, first_write: bool) -> None:
+    if first_write and not os.path.isfile(TRADES_CSV):
+        trades.write_csv(TRADES_CSV)
+    else:
+        with open(TRADES_CSV, mode="a") as f:
+            trades.write_csv(f, include_header=False)
+
+
 def process_live() -> None:
     print("=" * 60)
     print("🔄 Processing trades")
@@ -199,47 +244,61 @@ def process_live() -> None:
     else:
         print("⚠ No existing trades.csv — processing from beginning")
 
-    df = pl.read_csv(
-        ORDERS_CSV,
-        schema_overrides={"makerAssetId": pl.Utf8, "takerAssetId": pl.Utf8},
-    )
-    df = df.with_columns(pl.from_epoch(pl.col("timestamp"), time_unit="s").alias("timestamp"))
-    print(f"✓ Loaded {len(df):,} order events")
-
-    df = df.with_row_index()
-    if last is None:
-        new_orders = df.drop("index")
-    else:
-        marker = df.filter(
-            (pl.col("timestamp") == last["timestamp"])
-            & (pl.col("transactionHash") == last["transactionHash"])
-            & (pl.col("maker") == last["maker"])
-            & (pl.col("taker") == last["taker"])
-        )
-        if marker.is_empty():
-            print("⚠ Last-processed marker not found; reprocessing everything")
-            new_orders = df.drop("index")
-        else:
-            new_orders = df.filter(pl.col("index") > marker.row(0)[0]).drop("index")
-
-    print(f"⚙️  Processing {len(new_orders):,} new orders…")
-
-    # Load markets first so we can both fetch missing tokens and do the join.
-    markets_df = get_markets()
+    # Streaming discovery pass (already low-memory via DictReader). Run first so
+    # update_missing_tokens populates missing_markets.csv before we load markets.
+    markets_df = get_lean_markets()
     _discover_missing_tokens(markets_df)
-    # Reload if we backfilled.
-    markets_df = get_markets()
-
-    trades = _processed_df(new_orders, markets_df)
+    markets_df = get_lean_markets()  # reload if backfilled
 
     os.makedirs("processed", exist_ok=True)
-    if os.path.isfile(TRADES_CSV):
-        print(f"✓ Appending {len(trades):,} rows → {TRADES_CSV}")
-        with open(TRADES_CSV, mode="a") as f:
-            trades.write_csv(f, include_header=False)
+
+    overrides = {"makerAssetId": pl.Utf8, "takerAssetId": pl.Utf8}
+
+    # Single reader path for both modes. CHUNK_SIZE=0 means "load everything"
+    # (accumulate all batches into one before processing). >0 streams per-chunk.
+    # Use a big batch_size as an I/O hint — polars treats it as a ceiling, not target.
+    target_per_chunk = CHUNK_SIZE if CHUNK_SIZE > 0 else sys.maxsize
+    reader = pl.read_csv_batched(
+        ORDERS_CSV,
+        schema_overrides=overrides,
+        batch_size=CHUNK_SIZE if CHUNK_SIZE > 0 else 100_000,
+    )
+
+    if CHUNK_SIZE > 0:
+        print(f"⚙️  Streaming in chunks of {CHUNK_SIZE:,} rows")
     else:
-        trades.write_csv(TRADES_CSV)
-        print(f"✓ Created {TRADES_CSV}")
+        print("⚙️  Loading all order events (chunking disabled)")
+
+    resumed = last is None
+    total_written = 0
+    first_write = not os.path.isfile(TRADES_CSV)
+
+    while True:
+        chunk = _accumulate(reader, target_per_chunk)
+        if chunk is None:
+            break
+        chunk = chunk.with_columns(
+            pl.from_epoch(pl.col("timestamp"), time_unit="s").alias("timestamp")
+        )
+        if not resumed:
+            marker_idx = _match_marker(chunk, last)
+            if marker_idx is None:
+                continue  # marker not in this chunk, skip entirely
+            chunk = chunk.slice(marker_idx + 1)
+            resumed = True
+            if chunk.is_empty():
+                continue
+        trades_chunk = _processed_df(chunk, markets_df)
+        _write_chunk(trades_chunk, first_write=first_write)
+        first_write = False
+        total_written += len(trades_chunk)
+        if CHUNK_SIZE > 0:
+            print(f"  +{len(trades_chunk):,} rows  (total: {total_written:,})")
+
+    if not resumed:
+        print("⚠ Last-processed marker not found anywhere; nothing written")
+    else:
+        print(f"✓ Done. Wrote {total_written:,} rows → {TRADES_CSV}")
 
     print("=" * 60)
     print("✅ Done")

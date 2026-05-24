@@ -163,6 +163,9 @@ Reads `data/orderFilled.csv`, finds the resume point in `processed/trades.csv`, 
 
 If any trade references a token ID not in `markets.csv`, it's backfilled into `missing_markets.csv` via a per-token Gamma API call before the join.
 
+**Environment variables:**
+- `PROCESS_CHUNK_SIZE` — when set to a positive integer (e.g. `500000`), the orders CSV is streamed in chunks of that many rows instead of loaded all at once. Use this if `orderFilled.csv` is large enough to strain memory. Default: `0` (no chunking, single-pass load).
+
 ## Analysis
 
 ```python

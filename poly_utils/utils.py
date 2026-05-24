@@ -27,6 +27,38 @@ MARKETS_CSV = "data/markets.csv"
 MISSING_MARKETS_CSV = "data/missing_markets.csv"
 
 
+def get_lean_markets() -> pl.DataFrame:
+    """
+    Same as `get_markets()` but loads only the three columns the trade processor
+    needs (`id`, `token1`, `token2`). Drops the wide schema to keep memory
+    bounded during chunked processing — typically ~10× smaller than get_markets().
+    """
+    frames = []
+    for fname in (MARKETS_CSV, MISSING_MARKETS_CSV):
+        if os.path.exists(fname):
+            df = pl.read_csv(
+                fname,
+                columns=["id", "clobTokenIds"],
+                schema_overrides={"id": pl.Utf8, "clobTokenIds": pl.Utf8},
+                ignore_errors=True,
+            )
+            frames.append(df)
+    if not frames:
+        raise FileNotFoundError(
+            "markets.csv not found — run update_markets() first"
+        )
+    df = pl.concat(frames, how="diagonal_relaxed").unique(subset=["id"], keep="first")
+    tokens = df["clobTokenIds"].map_elements(
+        _split_tokens, return_dtype=pl.List(pl.Utf8)
+    )
+    return df.with_columns(
+        [
+            tokens.list.get(0).alias("token1"),
+            tokens.list.get(1).alias("token2"),
+        ]
+    ).drop("clobTokenIds")
+
+
 def get_markets() -> pl.DataFrame:
     """
     Load markets.csv (+ missing_markets.csv if present) and derive token1/token2
