@@ -13,6 +13,9 @@ Polymarket migrated to a new set of CTF Exchange contracts on **2026-04-28** and
 
 The previous version is preserved at the [`v1-final`](https://github.com/warproxxx/poly_data/tree/v1-final) tag if you need it for historical analysis. **For any new work, use this v2 version.**
 
+The V1 retriever used goldsky's very leniet stack for free data but now goldsky only gives data thru turbo pipeline. It is expensive and complex. Other third party options are also high dependency too. So I have decided to get the data directly onchain in this version
+
+
 ## Configuration
 
 All tuning is via environment variables. 
