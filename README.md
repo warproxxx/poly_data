@@ -1,48 +1,48 @@
-# Polymarket Data
+# Polymarket Data (v2)
 
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](https://opensource.org/licenses/GPL-3.0)
 [![GitHub stars](https://img.shields.io/github/stars/warproxxx/poly_data)](https://github.com/warproxxx/poly_data/stargazers)
 [![GitHub last commit](https://img.shields.io/github/last-commit/warproxxx/poly_data)](https://github.com/warproxxx/poly_data/commits/main)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 
-A comprehensive data pipeline for fetching, processing, and analyzing Polymarket trading data. This system collects market information, order-filled events, and processes them into structured trade data.
+A pipeline for fetching, processing, and analyzing Polymarket v2 trading data. Reads order events directly from the Polymarket **CTF Exchange V2** contract on Polygon via JSON-RPC, joins them with market metadata from the Polymarket Gamma API, and writes structured trades to CSV.
+
+## ⚠️ v1 → v2 migration
+
+Polymarket migrated to a new set of CTF Exchange contracts on **2026-04-28** and stopped supporting their old subgraph indexer. The old pipeline in this repo (Goldsky subgraph + GraphQL polling) **no longer returns complete data**, so it has been removed.
+
+The previous version is preserved at the [`v1-final`](https://github.com/warproxxx/poly_data/tree/v1-final) tag if you need it for historical analysis. **For any new work, use this v2 version.**
 
 ## Table of Contents
 
-- [Quick Download](#quick-download)
 - [Overview](#overview)
 - [Installation](#installation)
+- [Polygon RPC setup](#polygon-rpc-setup)
 - [Quick Start](#quick-start)
 - [Project Structure](#project-structure)
 - [Data Files](#data-files)
 - [Pipeline Stages](#pipeline-stages)
-- [Dependencies](#dependencies)
-- [Features](#features)
-- [Data Schema Details](#data-schema-details)
-- [Analysis](#analysis)
+- [Resumable & Incremental](#resumable--incremental)
 - [Troubleshooting](#troubleshooting)
+- [Analysis](#analysis)
 - [License](#license)
-
-## Quick Download
-
-**First-time users**: Download the [latest data snapshot](https://polydata-archive.s3.us-east-1.amazonaws.com/orderFilled_complete.csv.xz) and extract it in the main repository directory before your first run [(backup if this doesn't work)](https://polydata-archive.s3.us-east-1.amazonaws.com/archive.tar.xz). This will save you over 2 days of initial data collection time.
 
 ## Overview
 
-This pipeline performs three main operations:
+`update.py` runs three stages:
 
-1. **Market Data Collection** - Fetches all Polymarket markets with metadata
-2. **Order Event Scraping** - Collects order-filled events from Goldsky subgraph
-3. **Trade Processing** - Transforms raw order events into structured trade data
+1. **Markets** — fetches all Polymarket markets (closed + active) via the Gamma **keyset** API (`/markets/keyset`). Resumable from a saved cursor; subsequent runs only fetch newly created markets.
+2. **Chain** — reads `OrderFilled` events from the CTF Exchange V2 contract (`0xE111180000d2663C0091e4f400237545B87B996B`) on Polygon via direct JSON-RPC. Resumable from the last scanned block.
+3. **Process** — joins order events with market metadata to produce labeled trades with price, USD amount, and BUY/SELL direction.
+
+Stages 1 and 2 run in **parallel** (different APIs, zero contention), so total wall time is `max(markets, chain)` rather than the sum.
 
 ## Installation
 
-This project uses [UV](https://docs.astral.sh/uv/) for fast, reliable package management.
-
-### Install UV
+This project uses [UV](https://docs.astral.sh/uv/) for fast package management.
 
 ```bash
-# macOS/Linux
+# macOS / Linux
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Windows
@@ -52,226 +52,136 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 pip install uv
 ```
 
-### Install Dependencies
+Then install dependencies:
 
 ```bash
-# Install all dependencies
 uv sync
-
-# Install with development dependencies (Jupyter, etc.)
-uv sync --extra dev
 ```
+
+## Polygon RPC setup
+
+The V1 retriever used goldsky's very leniet stack for free data but now goldsky only gives data thru turbo pipeline. It is expensive and high dependency. Other third party options are high dependency too. So I have decided to get the data directly onchain. For that it needs an RPC URL. If not set, it defaults to `https://polygon-bor-rpc.publicnode.com`
+
+For faster retrieval get a node from Quicknode or Alchemy in their premier tiers. If you have no idea what that is, you can sign up [here](https://quicknode.com/signup?via=daniel-s)
 
 ## Quick Start
 
 ```bash
-# Run with UV (recommended)
-uv run python update_all.py
-
-# Or activate the virtual environment first
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-python update_all.py
+uv run python update.py
 ```
 
-This will sequentially run all three pipeline stages:
-- Update markets from Polymarket API
-- Update order-filled events from Goldsky
-- Process new orders into trades
+That's it. Runs markets + chain in parallel, then processes trades. **First run is the long one** — initial markets fetch is ~hour, initial chain backfill from v2 genesis (~April 2026) is several hours on a free RPC. Subsequent runs are seconds.
+
+To run any stage individually:
+
+```bash
+uv run python -m update_utils.update_markets
+uv run python -m update_utils.update_chain
+uv run python -m update_utils.process_live
+```
 
 ## Project Structure
 
 ```
 poly_data/
-├── update_all.py              # Main orchestrator script
-├── update_utils/              # Data collection modules
-│   ├── update_markets.py      # Fetch markets from Polymarket API
-│   ├── update_goldsky.py      # Scrape order events from Goldsky
-│   └── process_live.py        # Process orders into trades
-├── poly_utils/                # Utility functions
-│   └── utils.py               # Market loading and missing token handling
-├── markets.csv                # Main markets dataset
-├── missing_markets.csv        # Markets discovered from trades (auto-generated)
-├── goldsky/                   # Order-filled events (auto-generated)
-│   └── orderFilled.csv
-└── processed/                 # Processed trade data (auto-generated)
-    └── trades.csv
+├── update.py                  # orchestrator: markets + chain in parallel, then process
+├── update_utils/
+│   ├── update_markets.py      # Polymarket Gamma keyset API → markets.csv
+│   ├── update_chain.py        # Polygon RPC OrderFilled events → data/orderFilled.csv
+│   └── process_live.py        # join orders ↔ markets → processed/trades.csv
+├── poly_utils/
+│   └── utils.py               # market loader, missing-token backfill
+├── data/                      # all generated data + resume state (gitignored)
+│   ├── markets.csv            # all markets, all fields preserved
+│   ├── missing_markets.csv    # markets backfilled per-token from trades
+│   ├── markets_*_part.csv     # per-pass keyset output (closed/active)
+│   ├── markets_*_state.json   # keyset cursor state for incremental resume
+│   ├── orderFilled.csv        # raw order events from chain
+│   └── cursor_state.json      # last scanned block
+└── processed/                 # user-facing output (gitignored)
+    └── trades.csv             # labeled trades for analysis
 ```
 
 ## Data Files
 
-### markets.csv
-Market metadata including:
-- Market question, outcomes, and tokens
-- Creation/close times and slugs
-- Trading volume and condition IDs
-- Negative risk indicators
+### `data/markets.csv`
+All markets returned by the Gamma keyset API. **All API fields are preserved as-is**; nested objects (`outcomes`, `clobTokenIds`, `events`, etc.) are stored as JSON strings. The exact column set is determined by the first batch the API returns and persisted in `markets_*_state.json` so resumed runs stay consistent.
 
-**Fields**: `createdAt`, `id`, `question`, `answer1`, `answer2`, `neg_risk`, `market_slug`, `token1`, `token2`, `condition_id`, `volume`, `ticker`, `closedTime`
+Key fields used downstream: `id`, `question`, `slug`, `conditionId`, `clobTokenIds` (JSON array — first element = `token1`, second = `token2`), `closedTime`, `volume`.
 
-### goldsky/orderFilled.csv
-Raw order-filled events with:
-- Maker/taker addresses and asset IDs
-- Fill amounts and transaction hashes
-- Unix timestamps
+### `data/orderFilled.csv`
+Raw `OrderFilled` events decoded from the chain. Schema:
 
-**Fields**: `timestamp`, `maker`, `makerAssetId`, `makerAmountFilled`, `taker`, `takerAssetId`, `takerAmountFilled`, `transactionHash`
+| Column | Notes |
+|---|---|
+| `timestamp` | Unix seconds (from block timestamp) |
+| `maker` | Maker address, lowercase |
+| `makerAssetId` | `"0"` if maker is paying USDC; otherwise the CTF token ID |
+| `makerAmountFilled` | Raw integer (6 decimals — USDC and CTF tokens both use 6) |
+| `taker` | Taker address, lowercase |
+| `takerAssetId` | `"0"` if taker is paying USDC; otherwise the CTF token ID |
+| `takerAmountFilled` | Raw integer (6 decimals) |
+| `transactionHash` | Polygon transaction hash |
 
-### processed/trades.csv
-Structured trade data including:
-- Market ID mapping and trade direction
-- Price, USD amount, and token amount
-- Maker/taker roles and transaction details
+The v2 `OrderFilled` event natively carries a single `tokenId` + `side` (BUY=0, SELL=1) referring to the maker's order. The reader maps that back to the v1-compatible maker/taker/asset schema above so downstream code stays simple. The CTF Exchange contract address `0xe111180000d2663c0091e4f400237545b87b996b` may appear as `taker` for some events — this is the contract acting as an intermediary for CTF mint/burn flows during cross-side matches; treat it as a sub-event rather than a counterparty.
 
-**Fields**: `timestamp`, `market_id`, `maker`, `taker`, `nonusdc_side`, `maker_direction`, `taker_direction`, `price`, `usd_amount`, `token_amount`, `transactionHash`
+### `processed/trades.csv`
+Labeled trades for analysis:
+
+| Column | Notes |
+|---|---|
+| `timestamp` | datetime |
+| `market_id` | from markets.csv (null if market wasn't found) |
+| `maker`, `taker` | addresses |
+| `nonusdc_side` | `"token1"` or `"token2"` |
+| `maker_direction`, `taker_direction` | `"BUY"` / `"SELL"` |
+| `price` | USDC per outcome token (0–1) |
+| `usd_amount` | trade size in USD |
+| `token_amount` | outcome tokens transferred |
+| `transactionHash` | |
 
 ## Pipeline Stages
 
-### 1. Update Markets (`update_markets.py`)
+### 1. `update_markets` — Polymarket Gamma keyset API
 
-Fetches all markets from Polymarket API in chronological order.
+Pages through `/markets/keyset` with `closed=true` then `closed=false`. Saves a cursor per pass; on subsequent runs, resumes from the cursor and only pulls newly created markets.
 
-**Features**:
-- Automatic resume from last offset (idempotent)
-- Rate limiting and error handling
-- Batch fetching (500 markets per request)
+Outputs `markets_closed_part.csv` + `markets_active_part.csv` (kept across runs as the source of truth) and merges them into `markets.csv` at the end of each run.
 
-**Usage**:
-```bash
-uv run python -c "from update_utils.update_markets import update_markets; update_markets()"
-```
+### 2. `update_chain` — Polygon RPC `OrderFilled` events
 
-### 2. Update Goldsky (`update_goldsky.py`)
+Calls `eth_getLogs` on the CTF Exchange V2 contract in windows of `POLYGON_BLOCK_RANGE` (default 500). Decodes events with the ABI, looks up block timestamps (cached per chunk), and appends to `data/orderFilled.csv`. Saves the last scanned block to `data/cursor_state.json`.
 
-Scrapes order-filled events from Goldsky subgraph API.
+**Environment variables:**
+- `POLYGON_RPC_URL` — HTTPS endpoint (default: `polygon-bor-rpc.publicnode.com`)
+- `POLYGON_BLOCK_RANGE` — blocks per `getLogs` call (default: `500`; auto-halves on errors)
+- `POLYGON_CONFIRMATIONS` — block confirmations to wait for reorg safety (default: `20`)
 
-**Features**:
-- Resumes from last timestamp automatically
-- Handles GraphQL queries with pagination
-- Deduplicates events
+### 3. `process_live`
 
-**Usage**:
-```bash
-uv run python -c "from update_utils.update_goldsky import update_goldsky; update_goldsky()"
-```
+Reads `data/orderFilled.csv`, finds the resume point in `processed/trades.csv`, joins new orders against `get_markets()` (which parses `clobTokenIds` into `token1`/`token2`), computes price/USD/direction, and appends to `processed/trades.csv`.
 
-### 3. Process Live Trades (`process_live.py`)
-
-Processes raw order events into structured trades.
-
-**Features**:
-- Maps asset IDs to markets using token lookup
-- Calculates prices and trade directions
-- Identifies BUY/SELL sides
-- Handles missing markets by discovering them from trades
-- Incremental processing from last checkpoint
-
-**Usage**:
-```bash
-uv run python -c "from update_utils.process_live import process_live; process_live()"
-```
-
-**Processing Logic**:
-- Identifies non-USDC asset in each trade
-- Maps to market and outcome token (token1/token2)
-- Determines maker/taker directions (BUY/SELL)
-- Calculates price as USDC amount per outcome token
-- Converts amounts from raw units (divides by 10^6)
-
-## Dependencies
-
-Dependencies are managed via `pyproject.toml` and installed automatically with `uv sync`.
-
-**Key Libraries**:
-- `polars` - Fast DataFrame operations
-- `pandas` - Data manipulation
-- `gql` - GraphQL client for Goldsky
-- `requests` - HTTP requests to Polymarket API
-- `flatten-json` - JSON flattening for nested responses
-
-**Development Dependencies** (optional, installed with `--extra dev`):
-- `jupyter` - Interactive notebooks
-- `notebook` - Jupyter notebook interface
-- `ipykernel` - Python kernel for Jupyter
-
-## Features
-
-### Resumable Operations
-All stages automatically resume from where they left off:
-- **Markets**: Counts existing CSV rows to set offset
-- **Goldsky**: Reads last timestamp from orderFilled.csv
-- **Processing**: Finds last processed transaction hash
-
-### Error Handling
-- Automatic retries on network failures
-- Rate limit detection and backoff
-- Server error (500) handling
-- Graceful fallbacks for missing data
-
-### Missing Market Discovery
-The processing stage automatically discovers markets that weren't in the initial markets.csv (e.g., markets created after last update) and fetches them via the Polymarket API, saving to `missing_markets.csv`.
-
-## Data Schema Details
-
-### Trade Direction Logic
-- **Taker Direction**: BUY if paying USDC, SELL if receiving USDC
-- **Maker Direction**: Opposite of taker direction
-- **Price**: Always expressed as USDC per outcome token
-
-### Asset Mapping
-- `makerAssetId`/`takerAssetId` of "0" represents USDC
-- Non-zero IDs are outcome token IDs (token1/token2 from markets)
-- Each trade involves USDC and one outcome token
-
-## Notes
-
-- All amounts are normalized to standard decimal format (divided by 10^6)
-- Timestamps are converted from Unix epoch to datetime
-- Platform wallets (`0xc5d563a36ae78145c45a50134d48a1215220f80a`, `0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e`) are tracked in `poly_utils/utils.py`
-- Negative risk markets are flagged in the market data
-
-## Troubleshooting
-
-**Issue**: Markets not found during processing
-**Solution**: Run `update_markets()` first, or let `process_live()` auto-discover them
-
-**Issue**: Duplicate trades
-**Solution**: Deduplication is automatic - re-run processing from scratch if needed
-
-**Issue**: Rate limiting
-**Solution**: The pipeline handles this automatically with exponential backoff
+If any trade references a token ID not in `markets.csv`, it's backfilled into `missing_markets.csv` via a per-token Gamma API call before the join.
 
 ## Analysis
 
-### Loading Data
-
 ```python
-import pandas as pd
 import polars as pl
-from poly_utils import get_markets, PLATFORM_WALLETS
+from poly_utils.utils import get_markets
 
-# Load markets
-markets_df = get_markets()
+markets_df = get_markets()           # parses clobTokenIds → token1/token2
+trades_df = pl.read_csv("processed/trades.csv", try_parse_dates=True)
 
-# Load trades
-df = pl.scan_csv("processed/trades.csv").collect(streaming=True)
-df = df.with_columns(
-    pl.col("timestamp").str.to_datetime().alias("timestamp")
-)
-```
-
-### Filtering Trades by User
-
-**Important**: When filtering for a specific user's trades, filter by the `maker` column. Even though it appears you're only getting trades where the user is the maker, this is how Polymarket generates events at the contract level. The `maker` column shows trades from that user's perspective including price.
-
-```python
+# Filter trades for a specific user (filter on `maker` — see note below)
 USERS = {
     'domah': '0x9d84ce0306f8551e02efef1680475fc0f1dc1344',
     '50pence': '0x3cf3e8d5427aed066a7a5926980600f6c3cf87b3',
-    'fhantom': '0x6356fb47642a028bc09df92023c35a21a0b41885',
-    'car': '0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b',
-    'theo4': '0x56687bf447db6ffa42ffe2204a05edaa20f55839'
 }
-
-# Get all trades for a specific user
-trader_df = df.filter((pl.col("maker") == USERS['domah']))
+trader_df = trades_df.filter(pl.col("maker") == USERS['domah'])
 ```
+
+**Note on user filtering**: Polymarket emits `OrderFilled` from the maker's perspective at the contract level. When you want a user's trades from their side, filter on `maker`, not `taker`.
+
+## License
+
+GPL-3.0 — see [LICENSE](LICENSE).

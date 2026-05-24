@@ -1,213 +1,154 @@
-import os
+"""Helpers for loading markets and backfilling tokens that aren't in markets.csv."""
+
 import csv
 import json
-import requests
-import time
-from typing import List
+import os
+from typing import Iterable
+
 import polars as pl
+import requests
 
-PLATFORM_WALLETS = ['0xc5d563a36ae78145c45a50134d48a1215220f80a', '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e']
+GAMMA_MARKETS = "https://gamma-api.polymarket.com/markets"
 
 
-def get_markets(main_file: str = "markets.csv", missing_file: str = "missing_markets.csv"):
+def _split_tokens(s):
+    if not s:
+        return [None, None]
+    try:
+        arr = json.loads(s)
+        t1 = str(arr[0]) if len(arr) > 0 else None
+        t2 = str(arr[1]) if len(arr) > 1 else None
+        return [t1, t2]
+    except Exception:
+        return [None, None]
+
+
+MARKETS_CSV = "data/markets.csv"
+MISSING_MARKETS_CSV = "data/missing_markets.csv"
+
+
+def get_markets() -> pl.DataFrame:
     """
-    Load and combine markets from both files, deduplicate, and sort by createdAt
-    Returns combined Polars DataFrame sorted by creation date
+    Load markets.csv (+ missing_markets.csv if present) and derive token1/token2
+    from the JSON-encoded clobTokenIds column written by update_markets().
     """
-    import polars as pl
-    
-    # Schema overrides for long token IDs
-    schema_overrides = {
-        "token1": pl.Utf8,      # 76-digit ids → strings
-        "token2": pl.Utf8,
-    }
-    
-    dfs = []
-    
-    # Load main markets file
-    if os.path.exists(main_file):
-        main_df = pl.scan_csv(main_file, schema_overrides=schema_overrides).collect(streaming=True)
-        dfs.append(main_df)
-        print(f"Loaded {len(main_df)} markets from {main_file}")
-    
-    # Load missing markets file
-    if os.path.exists(missing_file):
-        missing_df = pl.scan_csv(missing_file, schema_overrides=schema_overrides).collect(streaming=True)
-        dfs.append(missing_df)
-        print(f"Loaded {len(missing_df)} markets from {missing_file}")
-    
-    if not dfs:
-        print("No market files found!")
-        return pl.DataFrame()
-    
-    # Combine, deduplicate, and sort
-    combined_df = (
-        pl.concat(dfs)
-        .unique(subset=['id'], keep='first')
-        .sort('createdAt')
+    frames = []
+    for fname in (MARKETS_CSV, MISSING_MARKETS_CSV):
+        if os.path.exists(fname):
+            # Force id/clobTokenIds to string so concat across files stays consistent.
+            df = pl.read_csv(
+                fname,
+                infer_schema_length=10_000,
+                schema_overrides={"id": pl.Utf8, "clobTokenIds": pl.Utf8},
+                ignore_errors=True,
+            )
+            frames.append(df)
+
+    if not frames:
+        raise FileNotFoundError(
+            "markets.csv not found — run update_markets() first"
+        )
+
+    df = pl.concat(frames, how="diagonal_relaxed").unique(subset=["id"], keep="first")
+
+    if "clobTokenIds" not in df.columns:
+        raise KeyError(
+            "markets.csv is missing the 'clobTokenIds' column — re-run update_markets()"
+        )
+
+    tokens = df["clobTokenIds"].map_elements(
+        _split_tokens, return_dtype=pl.List(pl.Utf8)
     )
-    
-    print(f"Combined total: {len(combined_df)} unique markets (sorted by createdAt)")
-    return combined_df
+    df = df.with_columns(
+        [
+            tokens.list.get(0).alias("token1"),
+            tokens.list.get(1).alias("token2"),
+        ]
+    )
+    return df
 
 
-def update_missing_tokens(missing_token_ids: List[str], csv_filename: str = "missing_markets.csv"):
+def _flatten_value(v):
+    if v is None:
+        return ""
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, ensure_ascii=False)
+    return v
+
+
+def update_missing_tokens(missing_ids: Iterable[str]) -> None:
     """
-    Fetch market data for missing token IDs and save to separate CSV file
-    
-    Args:
-        missing_token_ids: List of token IDs to fetch
-        csv_filename: CSV file to save missing markets (default: missing_markets.csv)
+    Fetch markets for asset IDs that appear in trades but aren't in markets.csv.
+    Appends results to missing_markets.csv using the same wide schema as
+    markets.csv (all API fields preserved, nested values JSON-encoded).
     """
-    if not missing_token_ids:
-        print("No missing tokens to fetch")
+    missing_ids = [m for m in missing_ids if m and m != "0"]
+    if not missing_ids:
         return
-    
-    print(f"Fetching {len(missing_token_ids)} missing tokens...")
-    
-    # Same headers as main markets.csv
-    headers = [
-        'createdAt', 'id', 'question', 'answer1', 'answer2', 'neg_risk', 
-        'market_slug', 'token1', 'token2', 'condition_id', 'volume', 'ticker', 'closedTime'
-    ]
-    
-    # Check if file exists to determine if we need headers
-    file_exists = os.path.exists(csv_filename)
-    
-    new_markets = []
-    processed_market_ids = set()
-    
-    # If file exists, read existing market IDs to avoid duplicates
-    if file_exists:
+
+    out = MISSING_MARKETS_CSV
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+
+    existing_ids: set = set()
+    existing_columns = None
+    if os.path.exists(out):
+        with open(out, newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if header:
+                existing_columns = header
+                if "id" in header:
+                    idx = header.index("id")
+                    for row in reader:
+                        if row and len(row) > idx:
+                            existing_ids.add(row[idx])
+
+    fetched: list = []
+    session = requests.Session()
+    for token_id in missing_ids:
+        # Gamma's default is closed=false. Most missed tokens are recently-closed
+        # short-duration markets (e.g. 15-min XRP/BTC price markets), so try
+        # closed=true first, then fall back to active.
+        markets: list = []
         try:
-            with open(csv_filename, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    if row.get('id'):
-                        processed_market_ids.add(row['id'])
-            print(f"Found {len(processed_market_ids)} existing markets in {csv_filename}")
-        except Exception as e:
-            print(f"Error reading existing file: {e}")
-    
-    for token_id in missing_token_ids:
-        print(f"Fetching market for token: {token_id}")
-        
-        retry_count = 0
-        max_retries = 3
-        
-        while retry_count < max_retries:
-            try:
-                response = requests.get(
-                    'https://gamma-api.polymarket.com/markets',
-                    params={'clob_token_ids': token_id},
-                    timeout=30
+            for closed_flag in ("true", "false"):
+                resp = session.get(
+                    GAMMA_MARKETS,
+                    params={
+                        "clob_token_ids": token_id,
+                        "closed": closed_flag,
+                        "limit": 1,
+                    },
+                    timeout=15,
                 )
-                
-                if response.status_code == 429:
-                    print(f"Rate limited - waiting 10 seconds...")
-                    time.sleep(10)
+                if resp.status_code != 200:
                     continue
-                elif response.status_code != 200:
-                    print(f"API error {response.status_code} for token {token_id}")
-                    retry_count += 1
-                    time.sleep(2)
-                    continue
-                
-                markets = response.json()
-                
-                if not markets:
-                    print(f"No market found for token {token_id}")
+                payload = resp.json()
+                markets = (
+                    payload
+                    if isinstance(payload, list)
+                    else payload.get("markets") or payload.get("data") or []
+                )
+                if markets:
                     break
-                
-                market = markets[0]
-                market_id = market.get('id', '')
-                
-                # Skip if we already have this market
-                if market_id in processed_market_ids:
-                    print(f"Market {market_id} already exists - skipping")
-                    break
-                
-                # Parse clobTokenIds
-                clob_tokens_str = market.get('clobTokenIds', '[]')
-                if isinstance(clob_tokens_str, str):
-                    clob_tokens = json.loads(clob_tokens_str)
-                else:
-                    clob_tokens = clob_tokens_str
-                
-                if len(clob_tokens) < 2:
-                    print(f"Invalid token data for {token_id}")
-                    break
-                
-                token1, token2 = clob_tokens[0], clob_tokens[1]
-                
-                # Parse outcomes
-                outcomes_str = market.get('outcomes', '[]')
-                if isinstance(outcomes_str, str):
-                    outcomes = json.loads(outcomes_str)
-                else:
-                    outcomes = outcomes_str
-                
-                answer1 = outcomes[0] if len(outcomes) > 0 else 'YES'
-                answer2 = outcomes[1] if len(outcomes) > 1 else 'NO'
-                
-                # Check for negative risk
-                neg_risk = market.get('negRiskAugmented', False) or market.get('negRiskOther', False)
-                
-                # Get ticker from events if available
-                ticker = ''
-                if market.get('events') and len(market.get('events', [])) > 0:
-                    ticker = market['events'][0].get('ticker', '')
-                
-                question_text = market.get('question', '') or market.get('title', '')
-                
-                # Create market row
-                row = [
-                    market.get('createdAt', ''),
-                    market_id,
-                    question_text,
-                    answer1,
-                    answer2,
-                    neg_risk,
-                    market.get('slug', ''),
-                    token1,
-                    token2,
-                    market.get('conditionId', ''),
-                    market.get('volume', ''),
-                    ticker,
-                    market.get('closedTime', '')
-                ]
-                
-                new_markets.append(row)
-                processed_market_ids.add(market_id)
-                print(f"Successfully fetched market {market_id} for token {token_id}")
-                break
-                
-            except Exception as e:
-                print(f"Error fetching token {token_id}: {e}")
-                retry_count += 1
-                time.sleep(2)
-        
-        if retry_count >= max_retries:
-            print(f"Failed to fetch token {token_id} after {max_retries} retries")
-        
-        # Small delay between requests
-        time.sleep(0.5)
-    
-    if not new_markets:
-        print("No new markets to add")
-        return
-    
-    # Write new markets to file
-    mode = 'a' if file_exists else 'w'
-    with open(csv_filename, mode, newline='', encoding='utf-8') as csvfile:
-        writer = csv.writer(csvfile)
-        
-        # Write headers only if new file
-        if not file_exists:
-            writer.writerow(headers)
-        
-        writer.writerows(new_markets)
-    
-    print(f"Added {len(new_markets)} new markets to {csv_filename}")
-    print(f"Total markets now in file: {len(processed_market_ids)}")
+            for m in markets:
+                mid = str(m.get("id", ""))
+                if mid and mid not in existing_ids:
+                    existing_ids.add(mid)
+                    fetched.append(m)
+        except Exception as e:
+            print(f"  ! failed to fetch market for token {token_id}: {e}")
 
+    if not fetched:
+        return
+
+    columns = existing_columns or list(fetched[0].keys())
+    write_header = not os.path.exists(out)
+    with open(out, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(columns)
+        for m in fetched:
+            writer.writerow([_flatten_value(m.get(c)) for c in columns])
+
+    print(f"  Fetched {len(fetched)} missing markets → {out}")

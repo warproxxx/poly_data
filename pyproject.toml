@@ -13,8 +13,7 @@ dependencies = [
     "pandas>=2.0.0",
     "polars>=0.19.0",
     "requests>=2.31.0",
-    "gql[requests]>=3.4.0",
-    "flatten-json>=0.1.13",
+    "web3>=6.0.0",
 ]
 
 [project.optional-dependencies]
