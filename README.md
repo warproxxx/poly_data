@@ -22,7 +22,7 @@ All tuning is via environment variables.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `POLYGON_RPC_URL` | `https://polygon-bor-rpc.publicnode.com` | Polygon JSON-RPC endpoint. Public default works but is slow and times out under sustained backfill. Free tier of [QuickNode](https://quicknode.com/signup?via=daniel-s) or [Chainstack](https://chainstack.com) is much more reliable. Paid tier recommended if you're doing it in a serious environment. |
+| `POLYGON_RPC_URL` | `https://polygon-bor-rpc.publicnode.com` | Polygon JSON-RPC endpoint. Public default works but is slow and times out under sustained backfill. Free tier of QuickNode or Alchemy is much more reliable. Paid tier recommended if you're doing it in a serious environment. |
 | `PROCESS_CHUNK_SIZE` | `0` | When `>0`, streams `data/orderFilled.csv` through chunks if your machine has limitations processing the data. Use `500000` if processing OOMs on your machine. |
 
 Set them in `.env` file:
