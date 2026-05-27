@@ -46,19 +46,23 @@ OUTPUT_DIR = "data"
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "orderFilled.csv")
 CURSOR_FILE = os.path.join(OUTPUT_DIR, "cursor_state.json")
 
-# Max blocks per eth_getLogs call. The window is adaptive: it shrinks on
-# provider range/size errors and grows back toward this cap on success, so a
-# high ceiling wins on sparse windows without re-discovering dense ones.
-#
-# Providers cap the per-query block range (QuickNode's free tier is small;
-# paid plans allow far more). Set POLYGON_MAX_BLOCK_RANGE to your plan's limit
-# to backfill faster. Default is a conservative free-tier value.
-BLOCK_RANGE = int(os.environ.get("POLYGON_MAX_BLOCK_RANGE", "4"))
-# Floor for the adaptive window — never larger than the cap. If a window this
-# small still fails, we error out rather than spin on a single oversized block.
-MIN_BLOCK_RANGE = min(4, BLOCK_RANGE)
+# Blocks per eth_getLogs call. Providers cap the per-query block range
+# (QuickNode's free tier is small; paid plans allow far more). Default is a
+# conservative free-tier value; set POLYGON_MAX_BLOCK_RANGE to your plan's limit
+# to backfill faster. If you raise it past what your RPC allows, the run stops
+# with an error telling you to lower it again.
+BLOCK_RANGE = int(os.environ.get("POLYGON_MAX_BLOCK_RANGE", "5"))
 # Reorg-safety buffer for Polygon.
 CONFIRMATIONS = 20
+
+# Rate limiting (HTTP 429): wait and retry the SAME request, forever — unlike a
+# 413, shrinking the range only sends more requests and makes it worse. Backoff
+# grows exponentially (1s, 2s, 4s, …) up to one minute, then retries every
+# minute until the provider lets us through. We never give up.
+RATE_LIMIT_BACKOFF_MAX = 60.0
+# Transient connection failures on startup get a few retries before we give up
+# with a clear message (vs. a wrong URL / dead endpoint, which shouldn't hang).
+CONNECT_MAX_RETRIES = 5
 
 COLUMNS = [
     "timestamp",
@@ -137,41 +141,76 @@ def _decode_log(log) -> dict:
     }
 
 
-def _get_logs_with_backoff(w3, start: int, end: int):
-    """Fetch logs, halving the range on provider-side range errors."""
-    cur_end = end
+def _is_rate_limited(msg: str) -> bool:
+    return "429" in msg or "too many requests" in msg
+
+
+def _call_with_rate_retry(fn, what: str):
+    """Run an RPC call, retrying forever on HTTP 429 with exponential backoff
+    capped at one minute. Other errors propagate to the caller unchanged."""
+    attempt = 0
     while True:
         try:
-            return w3.eth.get_logs(
+            return fn()
+        except Exception as e:
+            if not _is_rate_limited(str(e).lower()):
+                raise
+            delay = min(2 ** attempt, RATE_LIMIT_BACKOFF_MAX)
+            print(f"  ! rate limited (429) on {what}; waiting {delay:.0f}s then retrying")
+            time.sleep(delay)
+            attempt += 1
+
+
+def _connect(w3, rpc: str) -> int:
+    """Confirm the RPC is reachable and return the latest block number.
+
+    Calls block_number directly rather than w3.is_connected() — the latter
+    swallows the real error and returns False, hiding rate limits and giving us
+    nothing to retry on. 429s retry forever (via _call_with_rate_retry); other
+    transient failures retry a few times, then we raise with guidance."""
+    for attempt in range(CONNECT_MAX_RETRIES):
+        try:
+            return _call_with_rate_retry(lambda: w3.eth.block_number, "block_number")
+        except Exception as e:
+            if attempt + 1 >= CONNECT_MAX_RETRIES:
+                raise RuntimeError(
+                    f"Cannot reach Polygon RPC after {CONNECT_MAX_RETRIES} attempts: {rpc}\n"
+                    f"        Check POLYGON_RPC_URL and that your plan is active. Last error: {e}"
+                ) from e
+            delay = min(2 ** attempt, RATE_LIMIT_BACKOFF_MAX)
+            print(f"  ! RPC connect failed ({e}); retrying in {delay:.0f}s ({attempt + 1}/{CONNECT_MAX_RETRIES})")
+            time.sleep(delay)
+
+
+def _fetch_logs(w3, start: int, end: int):
+    """Fetch OrderFilled logs for [start, end]. Retries forever on 429.
+    If the RPC rejects the block range/response size, stop with guidance to
+    lower POLYGON_MAX_BLOCK_RANGE rather than silently shrinking."""
+    try:
+        return _call_with_rate_retry(
+            lambda: w3.eth.get_logs(
                 {
                     "fromBlock": start,
-                    "toBlock": cur_end,
+                    "toBlock": end,
                     "address": CTF_EXCHANGE_V2,
                     "topics": [ORDERFILLED_TOPIC],
                 }
-            ), cur_end
-        except Exception as e:
-            msg = str(e).lower()
-            # Shrink on provider range caps AND on oversized responses (HTTP 413):
-            # both mean "this window matched too much — split it."
-            range_err = any(
-                s in msg
-                for s in (
-                    "range",
-                    "too many",
-                    "limit",
-                    "result",
-                    "413",
-                    "too large",
-                    "entity too large",
-                )
-            )
-            new_end = start + (cur_end - start) // 2
-            # Bail if it isn't a range error, or we can't shrink any further.
-            if not range_err or new_end <= start or new_end >= cur_end:
-                raise
-            print(f"  ! get_logs failed ({e}); shrinking range {start}-{cur_end} → {start}-{new_end}")
-            cur_end = new_end
+            ),
+            f"get_logs {start}-{end}",
+        )
+    except Exception as e:
+        msg = str(e).lower()
+        range_err = any(
+            s in msg
+            for s in ("range", "too many", "limit", "result", "413", "too large", "entity too large")
+        )
+        if range_err:
+            raise RuntimeError(
+                f"RPC rejected blocks {start}-{end} ({end - start + 1} blocks): {e}\n"
+                f"        POLYGON_MAX_BLOCK_RANGE={BLOCK_RANGE} is too high for this RPC — "
+                f"lower it and re-run (it resumes from the saved cursor)."
+            ) from e
+        raise
 
 
 def update_chain() -> None:
@@ -182,14 +221,12 @@ def update_chain() -> None:
     w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 30}))
     # Polygon is PoA (Bor consensus) — extraData exceeds the 32-byte default validator.
     w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
-    if not w3.is_connected():
-        raise RuntimeError(f"Cannot connect to Polygon RPC: {rpc}")
 
-    latest = w3.eth.block_number
+    print(f"RPC: {rpc}")
+    latest = _connect(w3, rpc)
     safe_latest = latest - CONFIRMATIONS
     start_block = _load_cursor()
 
-    print(f"RPC: {rpc}")
     print(f"Latest block: {latest:,}  (safe: {safe_latest:,} after {CONFIRMATIONS} confs)")
     print(f"Resuming from block {start_block:,}")
 
@@ -204,21 +241,11 @@ def update_chain() -> None:
 
     cur = start_block
     total = 0
-    window = BLOCK_RANGE
     ts_cache: dict = {}
 
     while cur <= safe_latest:
-        requested_end = min(cur + window - 1, safe_latest)
-        logs, end = _get_logs_with_backoff(w3, cur, requested_end)
-
-        # Adapt the window: if the call had to shrink, carry the smaller size
-        # forward instead of re-discovering it next iteration; otherwise grow
-        # back toward the cap. Keeps dense regions from halving every window.
-        achieved = end - cur + 1
-        if end < requested_end:
-            window = max(MIN_BLOCK_RANGE, achieved)
-        else:
-            window = min(BLOCK_RANGE, max(achieved, window * 2))
+        end = min(cur + BLOCK_RANGE - 1, safe_latest)
+        logs = _fetch_logs(w3, cur, end)
 
         if logs:
             rows = []
@@ -226,7 +253,9 @@ def update_chain() -> None:
                 row = _decode_log(log)
                 bn = row.pop("_block_number")
                 if bn not in ts_cache:
-                    ts_cache[bn] = w3.eth.get_block(bn)["timestamp"]
+                    ts_cache[bn] = _call_with_rate_retry(
+                        lambda b=bn: w3.eth.get_block(b), f"get_block {bn}"
+                    )["timestamp"]
                 row["timestamp"] = ts_cache[bn]
                 rows.append([row[c] for c in COLUMNS])
 
