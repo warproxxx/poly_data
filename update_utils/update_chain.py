@@ -46,9 +46,17 @@ OUTPUT_DIR = "data"
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "orderFilled.csv")
 CURSOR_FILE = os.path.join(OUTPUT_DIR, "cursor_state.json")
 
-# Blocks per eth_getLogs call. Auto-halves on errors, so a higher default
-# is safe — wins on sparse windows, falls back on busy ones.
-BLOCK_RANGE = 1000
+# Max blocks per eth_getLogs call. The window is adaptive: it shrinks on
+# provider range/size errors and grows back toward this cap on success, so a
+# high ceiling wins on sparse windows without re-discovering dense ones.
+#
+# Providers cap the per-query block range (QuickNode's free tier is small;
+# paid plans allow far more). Set POLYGON_MAX_BLOCK_RANGE to your plan's limit
+# to backfill faster. Default is a conservative free-tier value.
+BLOCK_RANGE = int(os.environ.get("POLYGON_MAX_BLOCK_RANGE", "4"))
+# Floor for the adaptive window — never larger than the cap. If a window this
+# small still fails, we error out rather than spin on a single oversized block.
+MIN_BLOCK_RANGE = min(4, BLOCK_RANGE)
 # Reorg-safety buffer for Polygon.
 CONFIRMATIONS = 20
 
@@ -144,10 +152,24 @@ def _get_logs_with_backoff(w3, start: int, end: int):
             ), cur_end
         except Exception as e:
             msg = str(e).lower()
-            range_err = any(s in msg for s in ("range", "too many", "limit", "result"))
-            if not range_err or cur_end <= start:
+            # Shrink on provider range caps AND on oversized responses (HTTP 413):
+            # both mean "this window matched too much — split it."
+            range_err = any(
+                s in msg
+                for s in (
+                    "range",
+                    "too many",
+                    "limit",
+                    "result",
+                    "413",
+                    "too large",
+                    "entity too large",
+                )
+            )
+            new_end = start + (cur_end - start) // 2
+            # Bail if it isn't a range error, or we can't shrink any further.
+            if not range_err or new_end <= start or new_end >= cur_end:
                 raise
-            new_end = start + max(1, (cur_end - start) // 2)
             print(f"  ! get_logs failed ({e}); shrinking range {start}-{cur_end} → {start}-{new_end}")
             cur_end = new_end
 
@@ -182,11 +204,21 @@ def update_chain() -> None:
 
     cur = start_block
     total = 0
+    window = BLOCK_RANGE
     ts_cache: dict = {}
 
     while cur <= safe_latest:
-        end = min(cur + BLOCK_RANGE - 1, safe_latest)
-        logs, end = _get_logs_with_backoff(w3, cur, end)
+        requested_end = min(cur + window - 1, safe_latest)
+        logs, end = _get_logs_with_backoff(w3, cur, requested_end)
+
+        # Adapt the window: if the call had to shrink, carry the smaller size
+        # forward instead of re-discovering it next iteration; otherwise grow
+        # back toward the cap. Keeps dense regions from halving every window.
+        achieved = end - cur + 1
+        if end < requested_end:
+            window = max(MIN_BLOCK_RANGE, achieved)
+        else:
+            window = min(BLOCK_RANGE, max(achieved, window * 2))
 
         if logs:
             rows = []

@@ -23,12 +23,14 @@ All tuning is via environment variables.
 | Variable | Default | What it does |
 |---|---|---|
 | `POLYGON_RPC_URL` | `https://polygon-bor-rpc.publicnode.com` | Polygon JSON-RPC endpoint. Public default works but is slow and times out under sustained backfill. Free tier of QuickNode or Alchemy is much more reliable. Paid tier recommended if you're doing it in a serious environment. |
+| `POLYGON_MAX_BLOCK_RANGE` | `4` | Max blocks per `eth_getLogs` query. Default is safe for free RPC tiers; if you have a paid plan, set it to `500` or `1000` to backfill much faster. The window auto-shrinks on busy ranges, so overshooting is safe. |
 | `PROCESS_CHUNK_SIZE` | `0` | When `>0`, streams `data/orderFilled.csv` through chunks if your machine has limitations processing the data. Use `500000` if processing OOMs on your machine. |
 
 Set them in `.env` file:
 
 ```bash
 export POLYGON_RPC_URL="https://your-endpoint-here"
+export POLYGON_MAX_BLOCK_RANGE=1000   # paid RPC plan? bump from 4 to 500 or 1000
 export PROCESS_CHUNK_SIZE=500000   # only if RAM is tight
 ```
 
