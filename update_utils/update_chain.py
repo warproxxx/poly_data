@@ -19,9 +19,13 @@ import os
 import time
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
 from eth_abi import decode as abi_decode
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
+
+# Load POLYGON_RPC_URL (and friends) from a .env in the project root.
+load_dotenv()
 
 # Polymarket CTF Exchange V2 on Polygon (deployed 2026-03-31).
 # Migration from v1 occurred on 2026-04-28.
