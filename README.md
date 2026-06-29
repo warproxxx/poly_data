@@ -5,7 +5,7 @@
 [![GitHub last commit](https://img.shields.io/github/last-commit/warproxxx/poly_data)](https://github.com/warproxxx/poly_data/commits/main)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 
-A pipeline for fetching, processing, and analyzing Polymarket v2 trading data. Streams order events directly from the Polymarket **CTF Exchange V2** contract on Polygon via [Envio HyperSync](https://docs.envio.dev/docs/HyperSync/overview), joins them with market metadata from the Polymarket Gamma API, and writes structured trades to CSV.
+A pipeline for fetching, processing, and analyzing Polymarket v2 trading data. Streams order events directly from the Polymarket **CTF Exchange V2** contract on Polygon via [Envio HyperSync](https://docs.envio.dev/docs/HyperSync/overview), joins them with market metadata from the Polymarket CLOB API, and writes structured trades to CSV.
 
 ## ⚠️ v1 → v2 migration
 
@@ -13,9 +13,9 @@ Polymarket migrated to a new set of CTF Exchange contracts on **2026-04-28** and
 
 The previous version is preserved at the [`v1-final`](https://github.com/warproxxx/poly_data/tree/v1-final) tag if you need it for historical analysis. **For any new work, use this v2 version.**
 
-The V1 retriever used goldsky's very lenient stack for free data but now goldsky only gives data through a turbo pipeline that is expensive and complex. 
+The V1 retriever used goldsky, but now goldsky only gives data through a turbo pipeline that is expensive and complex. 
 
-V2 reads directly from on-chain events via HyperSync, which streams logs (with block timestamps inline) across the full chain in a single connection — no RPC throttling and no per-block timestamp lookups. A single request scans hundreds of thousands of blocks, so the full backfill is only a handful of requests. HyperSync requires a free API token (mandatory since 2025-11-03); generate one at [envio.dev/app/api-tokens](https://envio.dev/app/api-tokens) and set it as `HYPERSYNC_API`.
+V2 reads directly from on-chain events via HyperSync, which streams logs (with block timestamps inline) across the full chain in a single connection without RPC throttling. A single request scans hundreds of thousands of blocks, so the full backfill is only a handful of requests. HyperSync requires a free API token (mandatory since 2025-11-03); generate one at [envio.dev/app/api-tokens](https://envio.dev/app/api-tokens) and set it as `HYPERSYNC_API`.
 
 
 ## Configuration
@@ -46,6 +46,7 @@ export PROCESS_CHUNK_SIZE=500000           # only if RAM is tight
 - [Pipeline Stages](#pipeline-stages)
 - [Resumable & Incremental](#resumable--incremental)
 - [Troubleshooting](#troubleshooting)
+- [Tests](#tests)
 - [Analysis](#analysis)
 - [License](#license)
 
@@ -53,11 +54,11 @@ export PROCESS_CHUNK_SIZE=500000           # only if RAM is tight
 
 `update.py` runs three stages:
 
-1. **Markets** — fetches all Polymarket markets (closed + active) via the Gamma **keyset** API (`/markets/keyset`). Resumable from a saved cursor; subsequent runs only fetch newly created markets.
+1. **Markets** — fetches all markets from the Polymarket **CLOB** API (`/markets`, 1000/page, concurrent) into `data/markets.csv`. Runs to completion first so the full list exists before any trade is processed.
 2. **Chain** — streams `OrderFilled` events from the CTF Exchange V2 contract (`0xE111180000d2663C0091e4f400237545B87B996B`) on Polygon via Envio HyperSync. Resumable from the last scanned block.
 3. **Process** — joins order events with market metadata to produce labeled trades with price, USD amount, and BUY/SELL direction.
 
-Stages 1 and 2 run in **parallel** (different APIs, zero contention), so total wall time is `max(markets, chain)` rather than the sum.
+The stages run **sequentially** (markets → chain → process): the complete market list is built first, so every scraped trade can be labeled against it.
 
 ## Installation
 
@@ -97,10 +98,10 @@ Without it the run stops immediately with a message telling you to set `HYPERSYN
 ## Quick Start
 
 ```bash
-uv run python update.py
+uv run poly-data        # or: uv run python update.py
 ```
 
-That's it. Runs markets + chain in parallel, then processes trades. **First run is the long one** — initial markets fetch is ~hour. Initial chain backfill from v2 genesis (~April 2026) over HyperSync is typically a few minutes. Subsequent runs are seconds.
+That's it. Runs markets → chain → process in order. **First run is the long one** — the full market list from CLOB takes a couple of minutes, then the initial chain backfill from v2 genesis (~April 2026) over HyperSync runs after it. Subsequent runs only pull deltas.
 
 To run any stage individually:
 
@@ -114,18 +115,19 @@ uv run python -m update_utils.process_live
 
 ```
 poly_data/
-├── update.py                  # orchestrator: markets + chain in parallel, then process
+├── update.py                  # thin shim → update_utils.pipeline.main
 ├── update_utils/
-│   ├── update_markets.py      # Polymarket Gamma keyset API → markets.csv
+│   ├── pipeline.py            # orchestrator: markets → chain → process (poly-data entrypoint)
+│   ├── update_markets.py      # Polymarket CLOB /markets → markets.csv
 │   ├── update_chain.py        # HyperSync OrderFilled events → data/orderFilled.csv
 │   └── process_live.py        # join orders ↔ markets → processed/trades.csv
 ├── poly_utils/
 │   └── utils.py               # market loader, missing-token backfill
+├── tests/                     # pytest unit tests (pure, offline)
 ├── data/                      # all generated data + resume state (gitignored)
-│   ├── markets.csv            # all markets, all fields preserved
+│   ├── markets.csv            # all markets (id = condition_id, clobTokenIds, …)
 │   ├── missing_markets.csv    # markets backfilled per-token from trades
-│   ├── markets_*_part.csv     # per-pass keyset output (closed/active)
-│   ├── markets_*_state.json   # keyset cursor state for incremental resume
+│   ├── markets_state.json     # CLOB pagination cursor for incremental resume
 │   ├── orderFilled.csv        # raw order events from chain
 │   └── cursor_state.json      # last scanned block
 └── processed/                 # user-facing output (gitignored)
@@ -135,9 +137,9 @@ poly_data/
 ## Data Files
 
 ### `data/markets.csv`
-All markets returned by the Gamma keyset API. **All API fields are preserved as-is**; nested objects (`outcomes`, `clobTokenIds`, `events`, etc.) are stored as JSON strings. The exact column set is determined by the first batch the API returns and persisted in `markets_*_state.json` so resumed runs stay consistent.
+All markets from the Polymarket CLOB API. **Every field the CLOB market object carries is preserved as-is**; nested objects (`tokens`, `tags`, `rewards`, etc.) are stored as JSON strings. Two derived columns are prepended for the downstream join: `id` (= the on-chain `condition_id`) and `clobTokenIds` (JSON array of the market's two token IDs). Column order is set by the first market fetched.
 
-Key fields used downstream: `id`, `question`, `slug`, `conditionId`, `clobTokenIds` (JSON array — first element = `token1`, second = `token2`), `closedTime`, `volume`.
+Key fields used downstream: `id` (= `condition_id`), `clobTokenIds` (JSON array — first element = `token1`, second = `token2`), `question`, `market_slug`, `closed`.
 
 ### `data/orderFilled.csv`
 Raw `OrderFilled` events decoded from the chain. Schema:
@@ -172,11 +174,9 @@ Labeled trades for analysis:
 
 ## Pipeline Stages
 
-### 1. `update_markets` — Polymarket Gamma keyset API
+### 1. `update_markets` — Polymarket CLOB `/markets`
 
-Pages through `/markets/keyset` with `closed=true` then `closed=false`. Saves a cursor per pass; on subsequent runs, resumes from the cursor and only pulls newly created markets.
-
-Outputs `markets_closed_part.csv` + `markets_active_part.csv` (kept across runs as the source of truth) and merges them into `markets.csv` at the end of each run.
+Pages through the CLOB `/markets` endpoint (1000 markets/page, offset cursor) with concurrent request waves, covering the full ~1.5M-market history — closed and active — in a couple of minutes (vs. the old Gamma keyset's ~hour at 100/page). Each market is written to `data/markets.csv` with `id` = `condition_id` and `clobTokenIds` derived from its `tokens`. The next offset is saved to `data/markets_state.json` so an interrupted run resumes.
 
 ### 2. `update_chain` — HyperSync `OrderFilled` stream
 
@@ -186,7 +186,17 @@ Opens a HyperSync stream filtered to the CTF Exchange V2 contract and the `Order
 
 Reads `data/orderFilled.csv`, finds the resume point in `processed/trades.csv`, joins new orders against `get_markets()` (which parses `clobTokenIds` into `token1`/`token2`), computes price/USD/direction, and appends to `processed/trades.csv`.
 
-If any trade references a token ID not in `markets.csv`, it's backfilled into `missing_markets.csv` via a per-token Gamma API call before the join. For memory-bounded processing on large datasets, set `PROCESS_CHUNK_SIZE` — see [Configuration](#configuration).
+If any trade references a token ID not in `markets.csv`, it's backfilled into `missing_markets.csv` via batched, parallel Gamma API requests before the join (the CLOB list isn't queryable by token ID, so Gamma's `clob_token_ids` lookup is used here), with `id` = `conditionId` to stay consistent with `markets.csv`. For memory-bounded processing on large datasets, set `PROCESS_CHUNK_SIZE` — see [Configuration](#configuration).
+
+## Tests
+
+Unit tests cover the data-correctness logic — the `OrderFilled` decode and side→asset mapping, the trade-labeling transform (price, BUY/SELL direction, USD/token amounts), the CLOB market row mapping, and the parsing helpers. They're pure and offline (no network, no API token needed).
+
+```bash
+uv run pytest
+```
+
+Tests live in `tests/`. They exercise the pure functions directly, so a regression like a flipped trade side or inverted price fails fast.
 
 ## Analysis
 

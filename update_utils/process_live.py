@@ -10,7 +10,6 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import os
-import subprocess
 import sys
 
 import pandas as pd
@@ -32,9 +31,9 @@ CHUNK_SIZE = int(os.environ.get("PROCESS_CHUNK_SIZE", "0"))
 def _processed_df(df: pl.DataFrame, markets_df: pl.DataFrame) -> pl.DataFrame:
     markets_df = markets_df.rename({"id": "market_id"})
 
-    markets_long = markets_df.select(["market_id", "token1", "token2"]).melt(
-        id_vars="market_id",
-        value_vars=["token1", "token2"],
+    markets_long = markets_df.select(["market_id", "token1", "token2"]).unpivot(
+        index="market_id",
+        on=["token1", "token2"],
         variable_name="side",
         value_name="asset_id",
     )
@@ -144,15 +143,36 @@ def _processed_df(df: pl.DataFrame, markets_df: pl.DataFrame) -> pl.DataFrame:
     ]
 
 
+def _read_last_line(path: str) -> str:
+    """Return the last non-empty line of a (possibly huge) text file without
+    loading it — seek backwards from EOF in chunks. Cross-platform replacement
+    for shelling out to `tail` (which doesn't exist on Windows)."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        pos = f.tell()
+        if pos == 0:
+            return ""
+        buf = b""
+        while pos > 0:
+            step = min(4096, pos)
+            pos -= step
+            f.seek(pos)
+            buf = f.read(step) + buf
+            stripped = buf.rstrip(b"\r\n")
+            nl = stripped.rfind(b"\n")
+            if nl != -1:
+                return stripped[nl + 1:].decode("utf-8", errors="replace")
+        return buf.rstrip(b"\r\n").decode("utf-8", errors="replace")
+
+
 def _last_processed_marker():
     if not os.path.exists(TRADES_CSV):
         return None
-    result = subprocess.run(["tail", "-n", "1", TRADES_CSV], capture_output=True, text=True)
-    last_line = result.stdout.strip()
+    last_line = _read_last_line(TRADES_CSV).strip()
     if not last_line:
         return None
     parts = last_line.split(",")
-    if len(parts) < 4:
+    if len(parts) < 4 or parts[0] == "timestamp":  # empty or header-only file
         return None
     return {
         "timestamp": pd.to_datetime(parts[0]),
