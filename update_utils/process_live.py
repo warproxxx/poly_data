@@ -9,7 +9,6 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-import csv as csv_lib
 import os
 import subprocess
 import sys
@@ -164,17 +163,18 @@ def _last_processed_marker():
 
 
 def _discover_missing_tokens(markets_df: pl.DataFrame) -> None:
-    """Scan orderFilled.csv for asset IDs not present in markets and fetch them."""
-    maker_ids: set = set()
-    taker_ids: set = set()
-    with open(ORDERS_CSV, newline="", encoding="utf-8") as f:
-        reader = csv_lib.DictReader(f)
-        for row in reader:
-            if row.get("makerAssetId", "0") != "0":
-                maker_ids.add(row["makerAssetId"])
-            if row.get("takerAssetId", "0") != "0":
-                taker_ids.add(row["takerAssetId"])
-    trade_asset_ids = maker_ids | taker_ids
+    """Scan orderFilled.csv for asset IDs not present in markets and fetch them.
+
+    Uses a lazy polars scan (two columns only) so finding the distinct traded
+    tokens across tens of millions of rows takes seconds, not a Python row loop.
+    """
+    lf = pl.scan_csv(
+        ORDERS_CSV,
+        schema_overrides={"makerAssetId": pl.Utf8, "takerAssetId": pl.Utf8},
+    )
+    maker = lf.select("makerAssetId").filter(pl.col("makerAssetId") != "0").unique().collect()
+    taker = lf.select("takerAssetId").filter(pl.col("takerAssetId") != "0").unique().collect()
+    trade_asset_ids = set(maker["makerAssetId"].to_list()) | set(taker["takerAssetId"].to_list())
 
     existing = set()
     for col in ("token1", "token2"):
@@ -183,7 +183,7 @@ def _discover_missing_tokens(markets_df: pl.DataFrame) -> None:
 
     missing = sorted(trade_asset_ids - existing)
     if missing:
-        print(f"🔍 {len(missing)} markets not in markets.csv — fetching from Polymarket API")
+        print(f"🔍 {len(missing)} tokens not in markets.csv — fetching (batched) from Gamma")
         update_missing_tokens(missing)
     else:
         print("✅ All markets present")

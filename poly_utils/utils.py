@@ -3,12 +3,29 @@
 import csv
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Iterable
 
 import polars as pl
 import requests
 
 GAMMA_MARKETS = "https://gamma-api.polymarket.com/markets"
+
+# Token IDs per Gamma request. The URL holds ~50 of these 77-char ids before the
+# server returns 414 (URI too large), so 40 leaves headroom.
+_MISSING_BATCH = 40
+_MISSING_WORKERS = 12
+
+_local = threading.local()
+
+
+def _gamma_session() -> requests.Session:
+    s = getattr(_local, "s", None)
+    if s is None:
+        s = requests.Session()
+        _local.s = s
+    return s
 
 
 def _split_tokens(s):
@@ -108,11 +125,54 @@ def _flatten_value(v):
     return v
 
 
+def _market_cond_id(m: dict) -> str:
+    """Stable id for a Gamma market — conditionId, to match the CLOB-built
+    markets.csv (whose `id` column is the on-chain condition_id)."""
+    return str(m.get("conditionId") or m.get("id") or "")
+
+
+def _fetch_token_batch(token_ids: list) -> list:
+    """Fetch markets for a batch of token ids. Tries closed then active (Gamma
+    defaults to closed=false, but most missed tokens are recently-closed
+    short-duration markets), de-duped by conditionId within the batch."""
+    s = _gamma_session()
+    found: dict = {}
+    for closed_flag in ("true", "false"):
+        params = [("clob_token_ids", t) for t in token_ids]
+        params += [("closed", closed_flag), ("limit", len(token_ids))]
+        try:
+            resp = s.get(GAMMA_MARKETS, params=params, timeout=20)
+            if resp.status_code != 200:
+                continue
+            payload = resp.json()
+            markets = (
+                payload
+                if isinstance(payload, list)
+                else payload.get("markets") or payload.get("data") or []
+            )
+            for m in markets:
+                cid = _market_cond_id(m)
+                if cid:
+                    found[cid] = m
+        except Exception as e:
+            print(f"  ! batch fetch failed ({len(token_ids)} tokens): {e}")
+    return list(found.values())
+
+
+# Columns written to missing_markets.csv. `id` = conditionId so the join key and
+# market_id stay consistent with the CLOB-built markets.csv; clobTokenIds carries
+# the token pair through for get_lean_markets.
+_MISSING_COLUMNS = ["id", "clobTokenIds", "conditionId", "question", "slug", "closed"]
+
+
 def update_missing_tokens(missing_ids: Iterable[str]) -> None:
     """
     Fetch markets for asset IDs that appear in trades but aren't in markets.csv.
-    Appends results to missing_markets.csv using the same wide schema as
-    markets.csv (all API fields preserved, nested values JSON-encoded).
+
+    Batches token ids (~40 per Gamma request) and runs the batches in parallel,
+    rather than one request per token, so the run-time fallback is fast. Results
+    are appended to missing_markets.csv with `id` = conditionId, matching the
+    CLOB-built markets.csv schema.
     """
     missing_ids = [m for m in missing_ids if m and m != "0"]
     if not missing_ids:
@@ -122,65 +182,50 @@ def update_missing_tokens(missing_ids: Iterable[str]) -> None:
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
 
     existing_ids: set = set()
-    existing_columns = None
     if os.path.exists(out):
         with open(out, newline="", encoding="utf-8") as f:
             reader = csv.reader(f)
             header = next(reader, None)
-            if header:
-                existing_columns = header
-                if "id" in header:
-                    idx = header.index("id")
-                    for row in reader:
-                        if row and len(row) > idx:
-                            existing_ids.add(row[idx])
+            if header and "id" in header:
+                idx = header.index("id")
+                for row in reader:
+                    if row and len(row) > idx:
+                        existing_ids.add(row[idx])
+
+    batches = [
+        missing_ids[i : i + _MISSING_BATCH]
+        for i in range(0, len(missing_ids), _MISSING_BATCH)
+    ]
 
     fetched: list = []
-    session = requests.Session()
-    for token_id in missing_ids:
-        # Gamma's default is closed=false. Most missed tokens are recently-closed
-        # short-duration markets (e.g. 15-min XRP/BTC price markets), so try
-        # closed=true first, then fall back to active.
-        markets: list = []
-        try:
-            for closed_flag in ("true", "false"):
-                resp = session.get(
-                    GAMMA_MARKETS,
-                    params={
-                        "clob_token_ids": token_id,
-                        "closed": closed_flag,
-                        "limit": 1,
-                    },
-                    timeout=15,
-                )
-                if resp.status_code != 200:
-                    continue
-                payload = resp.json()
-                markets = (
-                    payload
-                    if isinstance(payload, list)
-                    else payload.get("markets") or payload.get("data") or []
-                )
-                if markets:
-                    break
+    with ThreadPoolExecutor(max_workers=_MISSING_WORKERS) as ex:
+        for markets in ex.map(_fetch_token_batch, batches):
             for m in markets:
-                mid = str(m.get("id", ""))
-                if mid and mid not in existing_ids:
-                    existing_ids.add(mid)
+                cid = _market_cond_id(m)
+                if cid and cid not in existing_ids:
+                    existing_ids.add(cid)
                     fetched.append(m)
-        except Exception as e:
-            print(f"  ! failed to fetch market for token {token_id}: {e}")
 
     if not fetched:
+        print("  (no markets found for missing tokens)")
         return
 
-    columns = existing_columns or list(fetched[0].keys())
     write_header = not os.path.exists(out)
     with open(out, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if write_header:
-            writer.writerow(columns)
+            writer.writerow(_MISSING_COLUMNS)
         for m in fetched:
-            writer.writerow([_flatten_value(m.get(c)) for c in columns])
+            cid = _market_cond_id(m)
+            writer.writerow(
+                [
+                    cid,
+                    _flatten_value(m.get("clobTokenIds")),
+                    cid,
+                    _flatten_value(m.get("question")),
+                    _flatten_value(m.get("slug")),
+                    _flatten_value(m.get("closed")),
+                ]
+            )
 
     print(f"  Fetched {len(fetched)} missing markets → {out}")

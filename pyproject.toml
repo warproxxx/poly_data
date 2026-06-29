@@ -27,6 +27,9 @@ dev = [
     "ipykernel>=6.25.0",
 ]
 
+[project.scripts]
+poly-data = "update_utils.pipeline:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
