@@ -5,19 +5,31 @@ would silently mislabel every trade. We build synthetic OrderFilled logs with
 eth_abi.encode (a real dependency) so decode is checked against known inputs.
 """
 
+import json
 import types
 
 import hypersync
 import pytest
 from eth_abi import encode as abi_encode
 
+import update_utils.update_chain as uc
 from update_utils.update_chain import (
     _DATA_TYPES,
     _as_int,
     _build_query,
     _decode_log,
+    _fmt_ts,
     _hex_to_bytes,
 )
+
+
+class TestFmtTs:
+    def test_epoch(self):
+        assert _fmt_ts(0) == "1970-01-01 00:00:00"
+
+    def test_known_utc(self):
+        # 1_700_000_000 = 2023-11-14 22:13:20 UTC
+        assert _fmt_ts(1_700_000_000) == "2023-11-14 22:13:20"
 
 
 def _topic_addr(addr_40hex: str) -> str:
@@ -107,3 +119,33 @@ class TestBuildQuery:
         # to_block is exclusive in HyperSync, so the helper passes to_block + 1.
         q = _build_query(100, 200)
         assert isinstance(q, hypersync.Query)
+
+
+class TestCursor:
+    def test_save_load_roundtrip(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(uc, "CURSOR_FILE", str(tmp_path / "cursor.json"))
+        uc._save_cursor(90_000_000, 7890)
+        assert uc._load_cursor() == (90_000_000, 7890)
+
+    def test_legacy_without_csv_bytes(self, tmp_path, monkeypatch):
+        p = tmp_path / "cursor.json"
+        p.write_text(json.dumps({"last_block": 90_000_000}))
+        monkeypatch.setattr(uc, "CURSOR_FILE", str(p))
+        assert uc._load_cursor() == (90_000_000, None)
+
+    def test_missing_returns_genesis(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(uc, "CURSOR_FILE", str(tmp_path / "nope.json"))
+        assert uc._load_cursor() == (uc.V2_GENESIS_BLOCK, None)
+
+    def test_below_genesis_ignored(self, tmp_path, monkeypatch):
+        p = tmp_path / "cursor.json"
+        p.write_text(json.dumps({"last_block": 1, "csv_bytes": 5}))
+        monkeypatch.setattr(uc, "CURSOR_FILE", str(p))
+        assert uc._load_cursor() == (uc.V2_GENESIS_BLOCK, None)
+
+    def test_atomic_write_leaves_no_tmp(self, tmp_path, monkeypatch):
+        cf = tmp_path / "cursor.json"
+        monkeypatch.setattr(uc, "CURSOR_FILE", str(cf))
+        uc._save_cursor(88_000_000, 100)
+        assert cf.exists()
+        assert not (tmp_path / "cursor.json.tmp").exists()

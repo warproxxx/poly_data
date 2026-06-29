@@ -22,10 +22,11 @@ import base64
 import csv
 import json
 import os
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional, Set
+from typing import List, Optional
 
 import requests
 
@@ -113,24 +114,30 @@ def _save_state(offset: int, fetched: int, columns: Optional[List[str]], complet
         )
 
 
-def _load_seen_ids(csv_file: str) -> Set[str]:
-    seen: Set[str] = set()
+def _read_tail_ids(csv_file: str, n: int) -> set:
+    """Return the `id` (first column) of up to the last `n` rows, reading only
+    a bounded chunk from the end of the file — avoids scanning a multi-GB CSV
+    just to seed the resume dedup set."""
     if not os.path.exists(csv_file):
-        return seen
-    with open(csv_file, newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        header = next(reader, None)
-        if not header or "id" not in header:
-            return seen
-        idx = header.index("id")
-        for row in reader:
-            if len(row) > idx:
-                seen.add(row[idx])
-    return seen
+        return set()
+    with open(csv_file, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        chunk = min(size, 16 * 1024 * 1024)
+        f.seek(size - chunk)
+        data = f.read(chunk)
+    lines = [ln for ln in data.split(b"\n") if ln.strip()]
+    if chunk < size:
+        lines = lines[1:]  # drop the (likely partial) first line
+    ids = {ln.split(b",", 1)[0].decode("utf-8", "replace") for ln in lines[-n:]}
+    ids.discard("id")  # header, if it landed in the window
+    return ids
 
 
 def update_markets(csv_filename: str = MARKETS_CSV, max_workers: int = WAVE) -> int:
     """Fetch all markets from CLOB into csv_filename. Resumable and concurrent."""
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)  # live progress when piped
     os.makedirs(os.path.dirname(csv_filename) or ".", exist_ok=True)
 
     state = _load_state()
@@ -138,10 +145,14 @@ def update_markets(csv_filename: str = MARKETS_CSV, max_workers: int = WAVE) -> 
     resuming = state.get("offset", 0) > 0 and os.path.exists(csv_filename)
 
     if resuming:
-        seen = _load_seen_ids(csv_filename)
-        offset = state["offset"]
-        fetched = len(seen)
-        print(f"  Resuming from offset {offset:,} ({fetched:,} markets already saved)")
+        fetched = state.get("fetched", 0)
+        # Resume from the start of the last (partial) page so markets added to
+        # that page since are picked up — independent of any overshoot in the
+        # saved offset. Dedup that page against its existing rows, read from the
+        # file tail rather than scanning the whole CSV.
+        offset = (fetched // PAGE) * PAGE
+        seen = _read_tail_ids(csv_filename, PAGE + 500)
+        print(f"  Resuming near offset {offset:,} ({fetched:,} markets already saved)")
         f = open(csv_filename, "a", newline="", encoding="utf-8")
     else:
         seen = set()

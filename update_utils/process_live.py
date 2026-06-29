@@ -250,6 +250,8 @@ def _write_chunk(trades: pl.DataFrame, first_write: bool) -> None:
 
 
 def process_live() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)  # live progress when piped
     print("=" * 60)
     print("🔄 Processing trades")
     print("=" * 60)

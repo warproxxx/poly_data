@@ -2,7 +2,28 @@
 
 import base64
 
-from update_utils.update_markets import _cursor, _flatten, _row, _token_ids
+from update_utils.update_markets import (
+    _cursor,
+    _flatten,
+    _read_tail_ids,
+    _row,
+    _token_ids,
+)
+
+
+class TestReadTailIds:
+    def test_last_ids(self, tmp_path):
+        p = tmp_path / "m.csv"
+        p.write_text("id,clobTokenIds\nc1,x\nc2,y\nc3,z\n")
+        assert _read_tail_ids(str(p), 2) == {"c2", "c3"}
+
+    def test_excludes_header(self, tmp_path):
+        p = tmp_path / "m.csv"
+        p.write_text("id,clobTokenIds\nc1,x\n")
+        assert _read_tail_ids(str(p), 10) == {"c1"}
+
+    def test_missing_file(self, tmp_path):
+        assert _read_tail_ids(str(tmp_path / "nope.csv"), 10) == set()
 
 
 class TestCursor:

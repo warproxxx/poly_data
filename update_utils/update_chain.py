@@ -17,6 +17,8 @@ import asyncio
 import csv
 import json
 import os
+import sys
+from datetime import datetime, timezone
 
 import hypersync
 from dotenv import load_dotenv
@@ -70,21 +72,40 @@ COLUMNS = [
 ]
 
 
-def _load_cursor() -> int:
+def _load_cursor():
+    """Return (last_block, csv_bytes). csv_bytes is the orderFilled.csv size
+    after the last committed batch, used to truncate any rows from an
+    interrupted batch on resume. None for legacy/missing state."""
     if os.path.isfile(CURSOR_FILE):
         try:
             with open(CURSOR_FILE) as f:
-                last = json.load(f).get("last_block")
+                state = json.load(f)
+            last = state.get("last_block")
             if isinstance(last, int) and last >= V2_GENESIS_BLOCK:
-                return last
+                cb = state.get("csv_bytes")
+                return last, (cb if isinstance(cb, int) else None)
         except Exception:
             pass
-    return V2_GENESIS_BLOCK
+    return V2_GENESIS_BLOCK, None
 
 
-def _save_cursor(next_block: int) -> None:
-    with open(CURSOR_FILE, "w") as f:
-        json.dump({"last_block": next_block}, f)
+def _save_cursor(next_block: int, csv_bytes: int) -> None:
+    """Persist the cursor atomically (write-temp + os.replace) so an interrupt
+    mid-write can't corrupt it into a genesis re-backfill."""
+    tmp = CURSOR_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"last_block": next_block, "csv_bytes": csv_bytes}, f)
+    os.replace(tmp, CURSOR_FILE)
+
+
+def _now() -> str:
+    """Wall-clock timestamp prefix for progress logs (HH:MM:SS)."""
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def _fmt_ts(unix_ts: int) -> str:
+    """Format an on-chain block unix timestamp as a UTC datetime."""
+    return datetime.fromtimestamp(unix_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _as_int(v):
@@ -177,57 +198,88 @@ async def _run() -> None:
         )
     client = hypersync.HypersyncClient(ClientConfig(url=url, bearer_token=token))
 
-    print(f"HyperSync: {url} (with token)")
+    print(f"[{_now()}] HyperSync: {url} (with token)")
 
     height = await client.get_height()
     safe_height = height - CONFIRMATIONS
-    start_block = _load_cursor()
+    start_block, committed_bytes = _load_cursor()
 
-    print(f"Archive height: {height:,}  (safe: {safe_height:,} after {CONFIRMATIONS} confs)")
-    print(f"Resuming from block {start_block:,}")
+    print(f"[{_now()}] Archive height: {height:,}  (safe: {safe_height:,} after {CONFIRMATIONS} confs)")
+    print(f"[{_now()}] Resuming from block {start_block:,}")
 
     if start_block > safe_height:
-        print("Already up to date.")
+        print(f"[{_now()}] Already up to date.")
         return
 
     new_file = not os.path.isfile(OUTPUT_FILE)
     if new_file:
         with open(OUTPUT_FILE, "w", newline="") as f:
             csv.writer(f).writerow(COLUMNS)
+    elif committed_bytes is not None:
+        # Drop any rows written past the last committed batch (interrupted run),
+        # so resuming from start_block can't duplicate them. Shrink only.
+        size = os.path.getsize(OUTPUT_FILE)
+        if size > committed_bytes:
+            os.truncate(OUTPUT_FILE, committed_bytes)
+            print(f"[{_now()}] Discarded {size - committed_bytes:,} bytes from an interrupted batch")
 
     query = _build_query(start_block, safe_height)
     receiver = await client.stream(query, StreamConfig())
 
     total = 0
-    while True:
-        res = await receiver.recv()
-        if res is None:
-            break
+    first_ts = last_ts = None
+    out = open(OUTPUT_FILE, "a", newline="")
+    writer = csv.writer(out)
+    try:
+        while True:
+            res = await receiver.recv()
+            if res is None:
+                break
 
-        blocks = res.data.blocks or []
-        logs = res.data.logs or []
+            blocks = res.data.blocks or []
+            logs = res.data.logs or []
 
-        ts_by_block = {_as_int(b.number): _as_int(b.timestamp) for b in blocks}
+            ts_by_block = {_as_int(b.number): _as_int(b.timestamp) for b in blocks}
 
-        if logs:
-            rows = [_decode_log(log, ts_by_block) for log in logs]
-            with open(OUTPUT_FILE, "a", newline="") as f:
-                csv.writer(f).writerows(rows)
-            total += len(rows)
+            if logs:
+                writer.writerows([_decode_log(log, ts_by_block) for log in logs])
+                out.flush()
+                total += len(logs)
 
-        # res.next_block is the first block NOT yet covered → save directly.
-        _save_cursor(res.next_block)
+            # Commit the batch atomically: the cursor records both the next block
+            # and the exact CSV size, so the two can never drift on interrupt.
+            committed_bytes = os.fstat(out.fileno()).st_size
+            _save_cursor(res.next_block, committed_bytes)
 
+            # Report the on-chain time we've reached (from block timestamps), not
+            # the opaque block number.
+            if ts_by_block:
+                if first_ts is None:
+                    first_ts = min(ts_by_block.values())
+                last_ts = max(ts_by_block.values())
+                reached = _fmt_ts(last_ts)
+            else:
+                reached = "       —             "
+            print(
+                f"[{_now()}]   reached {reached} UTC  block {res.next_block - 1:>10,}  "
+                f"events: {len(logs):>5}  total: {total:,}"
+            )
+    finally:
+        out.close()
+
+    if first_ts is not None:
         print(
-            f"  through block {res.next_block - 1:>10,}  "
-            f"events: {len(logs):>5}  total: {total:,}"
+            f"[{_now()}] Done. Wrote {total:,} new rows spanning "
+            f"{_fmt_ts(first_ts)} → {_fmt_ts(last_ts)} UTC."
         )
-
-    print(f"Done. Wrote {total:,} new rows to {OUTPUT_FILE}.")
+    else:
+        print(f"[{_now()}] Done. Wrote {total:,} new rows to {OUTPUT_FILE}.")
 
 
 def update_chain() -> None:
-    """Sync entrypoint so update.py's ThreadPoolExecutor can call it directly."""
+    """Sync entrypoint so the pipeline can call it directly."""
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)  # live progress when piped
     asyncio.run(_run())
 
 
