@@ -3,7 +3,7 @@ Update Polymarket v2 data:
 
   1. Pull markets (Gamma keyset API)  ─┐
                                        ├─ in parallel
-  2. Pull order events (Polygon RPC)  ─┘
+  2. Pull order events (HyperSync)    ─┘
   3. Process orders → labeled trades
 
 Both fetchers are independently resumable; subsequent runs only pull deltas.

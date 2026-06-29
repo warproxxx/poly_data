@@ -3,7 +3,7 @@ name = "poly-data"
 version = "0.1.0"
 description = "A comprehensive data pipeline for fetching, processing, and analyzing Polymarket trading data"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [
     { name = "Warproxxx", email = "" }
@@ -14,7 +14,10 @@ dependencies = [
     "polars>=0.19.0",
     "python-dotenv>=1.0.0",
     "requests>=2.31.0",
-    "web3>=6.0.0",
+    "hypersync>=1.2.0",
+    "eth-abi>=5.0.0",
+    "eth-utils>=4.0.0",
+    "eth-hash[pycryptodome]>=0.5.0",
 ]
 
 [project.optional-dependencies]

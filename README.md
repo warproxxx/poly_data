@@ -5,7 +5,7 @@
 [![GitHub last commit](https://img.shields.io/github/last-commit/warproxxx/poly_data)](https://github.com/warproxxx/poly_data/commits/main)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 
-A pipeline for fetching, processing, and analyzing Polymarket v2 trading data. Reads order events directly from the Polymarket **CTF Exchange V2** contract on Polygon via JSON-RPC, joins them with market metadata from the Polymarket Gamma API, and writes structured trades to CSV.
+A pipeline for fetching, processing, and analyzing Polymarket v2 trading data. Streams order events directly from the Polymarket **CTF Exchange V2** contract on Polygon via [Envio HyperSync](https://docs.envio.dev/docs/HyperSync/overview), joins them with market metadata from the Polymarket Gamma API, and writes structured trades to CSV.
 
 ## ⚠️ v1 → v2 migration
 
@@ -13,32 +13,33 @@ Polymarket migrated to a new set of CTF Exchange contracts on **2026-04-28** and
 
 The previous version is preserved at the [`v1-final`](https://github.com/warproxxx/poly_data/tree/v1-final) tag if you need it for historical analysis. **For any new work, use this v2 version.**
 
-The V1 retriever used goldsky's very leniet stack for free data but now goldsky only gives data thru turbo pipeline. It is expensive and complex. Other third party options are also high dependency too. So I have decided to get the data directly onchain in this version
+The V1 retriever used goldsky's very lenient stack for free data but now goldsky only gives data through a turbo pipeline that is expensive and complex. 
+
+V2 reads directly from on-chain events via HyperSync, which streams logs (with block timestamps inline) across the full chain in a single connection — no RPC throttling and no per-block timestamp lookups. A single request scans hundreds of thousands of blocks, so the full backfill is only a handful of requests. HyperSync requires a free API token (mandatory since 2025-11-03); generate one at [envio.dev/app/api-tokens](https://envio.dev/app/api-tokens) and set it as `HYPERSYNC_API`.
 
 
 ## Configuration
 
-All tuning is via environment variables. 
+All tuning is via environment variables.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `POLYGON_RPC_URL` | `https://polygon-bor-rpc.publicnode.com` | Polygon JSON-RPC endpoint. Public default works but is slow and times out under sustained backfill. Free tier of QuickNode or Alchemy is much more reliable. Paid tier recommended if you're doing it in a serious environment. |
-| `POLYGON_MAX_BLOCK_RANGE` | `5` | Blocks per `eth_getLogs` query. Default is safe for free RPC tiers; if you have a paid plan, set it to `500` or `1000` to backfill much faster. If you set it higher than your RPC allows, the run stops with an error telling you to lower it. |
+| `HYPERSYNC_API` | _(unset)_ | **Required.** Envio HyperSync bearer token (mandatory since 2025-11-03). Generate a free one at [envio.dev/app/api-tokens](https://envio.dev/app/api-tokens) — make sure it has **HyperSync** product access. Without it the endpoint returns 401/403. |
+| `POLYGON_HYPERSYNC_URL` | `https://polygon.hypersync.xyz` | Envio HyperSync endpoint for Polygon. Override only to point at a different network or a self-hosted instance. |
 | `PROCESS_CHUNK_SIZE` | `0` | When `>0`, streams `data/orderFilled.csv` through chunks if your machine has limitations processing the data. Use `500000` if processing OOMs on your machine. |
 
 Set them in `.env` file:
 
 ```bash
-export POLYGON_RPC_URL="https://your-endpoint-here"
-export POLYGON_MAX_BLOCK_RANGE=1000   # paid RPC plan? bump from 4 to 500 or 1000
-export PROCESS_CHUNK_SIZE=500000   # only if RAM is tight
+export HYPERSYNC_API="your-token-here"     # required — get one at envio.dev/app/api-tokens
+export PROCESS_CHUNK_SIZE=500000           # only if RAM is tight
 ```
 
 ## Table of Contents
 
 - [Overview](#overview)
 - [Installation](#installation)
-- [Polygon RPC setup](#polygon-rpc-setup)
+- [HyperSync API token](#hypersync-api-token)
 - [Quick Start](#quick-start)
 - [Project Structure](#project-structure)
 - [Data Files](#data-files)
@@ -53,7 +54,7 @@ export PROCESS_CHUNK_SIZE=500000   # only if RAM is tight
 `update.py` runs three stages:
 
 1. **Markets** — fetches all Polymarket markets (closed + active) via the Gamma **keyset** API (`/markets/keyset`). Resumable from a saved cursor; subsequent runs only fetch newly created markets.
-2. **Chain** — reads `OrderFilled` events from the CTF Exchange V2 contract (`0xE111180000d2663C0091e4f400237545B87B996B`) on Polygon via direct JSON-RPC. Resumable from the last scanned block.
+2. **Chain** — streams `OrderFilled` events from the CTF Exchange V2 contract (`0xE111180000d2663C0091e4f400237545B87B996B`) on Polygon via Envio HyperSync. Resumable from the last scanned block.
 3. **Process** — joins order events with market metadata to produce labeled trades with price, USD amount, and BUY/SELL direction.
 
 Stages 1 and 2 run in **parallel** (different APIs, zero contention), so total wall time is `max(markets, chain)` rather than the sum.
@@ -79,11 +80,19 @@ Then install dependencies:
 uv sync
 ```
 
-## Polygon RPC setup
+## HyperSync API token
 
-The V1 retriever used goldsky's very leniet stack for free data but now goldsky only gives data thru turbo pipeline. It is expensive and high dependency. Other third party options are high dependency too. So I have decided to get the data directly onchain. For that it needs an RPC URL. If not set, it defaults to `https://polygon-bor-rpc.publicnode.com`
+The chain stage streams from Envio HyperSync, which **requires a bearer token** (mandatory since 2025-11-03). The free tier is enough for this pipeline. Get one:
 
-For faster retrieval get a node from Quicknode or Alchemy in their premier tiers. If you have no idea what that is, you can sign up [here](https://quicknode.com/signup?via=daniel-s)
+1. Sign in at **[envio.dev/app/api-tokens](https://envio.dev/app/api-tokens)**.
+2. Create a new token. **Make sure it has _HyperSync_ product access** — a token scoped only to HyperRPC/HyperIndex authenticates but returns `403 "Your token does not have access to this product"` on data queries.
+3. Add it to a `.env` file in the project root:
+
+   ```bash
+   HYPERSYNC_API="your-token-here"
+   ```
+
+Without it the run stops immediately with a message telling you to set `HYPERSYNC_API`. The token authenticates the request; a single request scans hundreds of thousands of blocks, so the free-tier rate limit is a non-issue.
 
 ## Quick Start
 
@@ -91,7 +100,7 @@ For faster retrieval get a node from Quicknode or Alchemy in their premier tiers
 uv run python update.py
 ```
 
-That's it. Runs markets + chain in parallel, then processes trades. **First run is the long one** — initial markets fetch is ~hour, initial chain backfill from v2 genesis (~April 2026) is several hours on a free RPC. Subsequent runs are seconds.
+That's it. Runs markets + chain in parallel, then processes trades. **First run is the long one** — initial markets fetch is ~hour. Initial chain backfill from v2 genesis (~April 2026) over HyperSync is typically a few minutes. Subsequent runs are seconds.
 
 To run any stage individually:
 
@@ -108,7 +117,7 @@ poly_data/
 ├── update.py                  # orchestrator: markets + chain in parallel, then process
 ├── update_utils/
 │   ├── update_markets.py      # Polymarket Gamma keyset API → markets.csv
-│   ├── update_chain.py        # Polygon RPC OrderFilled events → data/orderFilled.csv
+│   ├── update_chain.py        # HyperSync OrderFilled events → data/orderFilled.csv
 │   └── process_live.py        # join orders ↔ markets → processed/trades.csv
 ├── poly_utils/
 │   └── utils.py               # market loader, missing-token backfill
@@ -169,9 +178,9 @@ Pages through `/markets/keyset` with `closed=true` then `closed=false`. Saves a 
 
 Outputs `markets_closed_part.csv` + `markets_active_part.csv` (kept across runs as the source of truth) and merges them into `markets.csv` at the end of each run.
 
-### 2. `update_chain` — Polygon RPC `OrderFilled` events
+### 2. `update_chain` — HyperSync `OrderFilled` stream
 
-Calls `eth_getLogs` on the CTF Exchange V2 contract in 1000-block windows (auto-halves on errors). Decodes events with the ABI, looks up block timestamps (cached per chunk), and appends to `data/orderFilled.csv`. Saves the last scanned block to `data/cursor_state.json`.
+Opens a HyperSync stream filtered to the CTF Exchange V2 contract and the `OrderFilled` topic. HyperSync returns logs in bulk along with their block timestamps in the same response, so there's no separate `eth_getBlock` pass. Each batch is ABI-decoded, appended to `data/orderFilled.csv`, and the `next_block` cursor is persisted to `data/cursor_state.json`. A 20-block reorg buffer is applied to the chain tip.
 
 ### 3. `process_live`
 

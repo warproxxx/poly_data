@@ -1,68 +1,62 @@
 """
-Polymarket CTF Exchange V2 OrderFilled event poller.
+Polymarket CTF Exchange V2 OrderFilled event reader (HyperSync).
 
-Reads order-fill events directly from Polygon via JSON-RPC.
-No Goldsky, no subgraph, no API key beyond an optional RPC URL.
-
-Writes data/orderFilled.csv with columns matching the legacy v1 shape so the
-downstream processor can stay close to its original form:
+Streams OrderFilled logs from the CTF Exchange V2 contract on Polygon via
+Envio's HyperSync and writes them to data/orderFilled.csv with v1-compatible
+columns so process_live.py can stay close to its original form:
 
     timestamp, maker, makerAssetId, makerAmountFilled,
     taker, takerAssetId, takerAmountFilled, transactionHash
 
-Cursor (last block scanned) is persisted in data/cursor_state.json.
+HyperSync returns block timestamps inline with logs, so there's no separate
+eth_getBlock pass. Cursor (last block scanned) is persisted in
+data/cursor_state.json.
 """
 
+import asyncio
 import csv
 import json
 import os
-import time
-from datetime import datetime, timezone
 
+import hypersync
 from dotenv import load_dotenv
 from eth_abi import decode as abi_decode
-from web3 import Web3
-from web3.middleware import ExtraDataToPOAMiddleware
+from eth_utils import keccak
+from hypersync import (
+    BlockField,
+    ClientConfig,
+    FieldSelection,
+    LogField,
+    LogSelection,
+    Query,
+    StreamConfig,
+)
 
-# Load POLYGON_RPC_URL (and friends) from a .env in the project root.
 load_dotenv()
 
 # Polymarket CTF Exchange V2 on Polygon (deployed 2026-03-31).
 # Migration from v1 occurred on 2026-04-28.
-CTF_EXCHANGE_V2 = Web3.to_checksum_address("0xE111180000d2663C0091e4f400237545B87B996B")
+CTF_EXCHANGE_V2 = "0xe111180000d2663c0091e4f400237545b87b996b"
 V2_GENESIS_BLOCK = 84_902_353
 
 # OrderFilled(bytes32,address,address,uint8,uint256,uint256,uint256,uint256,bytes32,bytes32)
 # 3 indexed params (orderHash, maker, taker) + 7 in data.
-ORDERFILLED_TOPIC = "0x" + Web3.keccak(
+ORDERFILLED_TOPIC = "0x" + keccak(
     text=(
         "OrderFilled(bytes32,address,address,uint8,uint256,"
         "uint256,uint256,uint256,bytes32,bytes32)"
     )
-).hex().lstrip("0x")
+).hex()
 _DATA_TYPES = ["uint8", "uint256", "uint256", "uint256", "uint256", "bytes32", "bytes32"]
 
 OUTPUT_DIR = "data"
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "orderFilled.csv")
 CURSOR_FILE = os.path.join(OUTPUT_DIR, "cursor_state.json")
 
-# Blocks per eth_getLogs call. Providers cap the per-query block range
-# (QuickNode's free tier is small; paid plans allow far more). Default is a
-# conservative free-tier value; set POLYGON_MAX_BLOCK_RANGE to your plan's limit
-# to backfill faster. If you raise it past what your RPC allows, the run stops
-# with an error telling you to lower it again.
-BLOCK_RANGE = int(os.environ.get("POLYGON_MAX_BLOCK_RANGE", "5"))
 # Reorg-safety buffer for Polygon.
 CONFIRMATIONS = 20
 
-# Rate limiting (HTTP 429): wait and retry the SAME request, forever — unlike a
-# 413, shrinking the range only sends more requests and makes it worse. Backoff
-# grows exponentially (1s, 2s, 4s, …) up to one minute, then retries every
-# minute until the provider lets us through. We never give up.
-RATE_LIMIT_BACKOFF_MAX = 60.0
-# Transient connection failures on startup get a few retries before we give up
-# with a clear message (vs. a wrong URL / dead endpoint, which shouldn't hang).
-CONNECT_MAX_RETRIES = 5
+DEFAULT_URL = "https://polygon.hypersync.xyz"
 
 COLUMNS = [
     "timestamp",
@@ -74,12 +68,6 @@ COLUMNS = [
     "takerAmountFilled",
     "transactionHash",
 ]
-
-DEFAULT_RPC = "https://polygon-bor-rpc.publicnode.com"
-
-
-def _rpc_url() -> str:
-    return os.environ.get("POLYGON_RPC_URL", DEFAULT_RPC)
 
 
 def _load_cursor() -> int:
@@ -99,138 +87,106 @@ def _save_cursor(next_block: int) -> None:
         json.dump({"last_block": next_block}, f)
 
 
-def _decode_log(log) -> dict:
-    """Decode a single OrderFilled log into a v1-shaped row."""
+def _as_int(v):
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        return int(v, 16) if v.startswith("0x") else int(v)
+    raise TypeError(f"unexpected numeric value: {v!r}")
+
+
+def _hex_to_bytes(s: str) -> bytes:
+    return bytes.fromhex(s[2:] if s.startswith("0x") else s)
+
+
+def _decode_log(log, ts_by_block: dict) -> list:
+    """Decode one HyperSync Log into a v1-shaped CSV row."""
     # topics: [event_sig, orderHash, maker, taker]
-    topics = log["topics"]
-    maker = "0x" + topics[2].hex()[-40:]
-    taker = "0x" + topics[3].hex()[-40:]
+    topics = log.topics
+    maker = "0x" + topics[2][-40:].lower()
+    taker = "0x" + topics[3][-40:].lower()
 
-    data = log["data"]
-    if isinstance(data, str):
-        data = bytes.fromhex(data[2:] if data.startswith("0x") else data)
-
+    data_bytes = _hex_to_bytes(log.data)
     side, token_id, maker_amt, taker_amt, _fee, _builder, _metadata = abi_decode(
-        _DATA_TYPES, data
+        _DATA_TYPES, data_bytes
     )
 
     # V2 `side` reflects the MAKER order's side. BUY=0, SELL=1.
     # process_live treats "0" as USDC and any other id as an outcome token.
     if side == 0:
-        # Maker buys tokens: gives USDC, gets tokens.
         maker_asset_id = "0"
         taker_asset_id = str(token_id)
     else:
-        # Maker sells tokens: gives tokens, gets USDC.
         maker_asset_id = str(token_id)
         taker_asset_id = "0"
 
-    tx_hash = log["transactionHash"]
-    if isinstance(tx_hash, (bytes, bytearray)):
-        tx_hash = "0x" + tx_hash.hex()
+    bn = _as_int(log.block_number)
+    tx_hash = log.transaction_hash
+    if not tx_hash.startswith("0x"):
+        tx_hash = "0x" + tx_hash
 
-    return {
-        "maker": maker.lower(),
-        "taker": taker.lower(),
-        "makerAssetId": maker_asset_id,
-        "takerAssetId": taker_asset_id,
-        "makerAmountFilled": str(maker_amt),
-        "takerAmountFilled": str(taker_amt),
-        "transactionHash": tx_hash,
-        "_block_number": log["blockNumber"],
-    }
-
-
-def _is_rate_limited(msg: str) -> bool:
-    return "429" in msg or "too many requests" in msg
+    return [
+        ts_by_block[bn],
+        maker,
+        maker_asset_id,
+        str(maker_amt),
+        taker,
+        taker_asset_id,
+        str(taker_amt),
+        tx_hash,
+    ]
 
 
-def _call_with_rate_retry(fn, what: str):
-    """Run an RPC call, retrying forever on HTTP 429 with exponential backoff
-    capped at one minute. Other errors propagate to the caller unchanged."""
-    attempt = 0
-    while True:
-        try:
-            return fn()
-        except Exception as e:
-            if not _is_rate_limited(str(e).lower()):
-                raise
-            delay = min(2 ** attempt, RATE_LIMIT_BACKOFF_MAX)
-            print(f"  ! rate limited (429) on {what}; waiting {delay:.0f}s then retrying")
-            time.sleep(delay)
-            attempt += 1
+def _build_query(from_block: int, to_block: int) -> Query:
+    return Query(
+        from_block=from_block,
+        to_block=to_block + 1,  # HyperSync to_block is exclusive
+        logs=[
+            LogSelection(
+                address=[CTF_EXCHANGE_V2],
+                topics=[[ORDERFILLED_TOPIC]],
+            )
+        ],
+        field_selection=FieldSelection(
+            block=[BlockField.NUMBER, BlockField.TIMESTAMP],
+            log=[
+                LogField.BLOCK_NUMBER,
+                LogField.TRANSACTION_HASH,
+                LogField.TOPIC0,
+                LogField.TOPIC1,
+                LogField.TOPIC2,
+                LogField.TOPIC3,
+                LogField.DATA,
+            ],
+        ),
+    )
 
 
-def _connect(w3, rpc: str) -> int:
-    """Confirm the RPC is reachable and return the latest block number.
-
-    Calls block_number directly rather than w3.is_connected() — the latter
-    swallows the real error and returns False, hiding rate limits and giving us
-    nothing to retry on. 429s retry forever (via _call_with_rate_retry); other
-    transient failures retry a few times, then we raise with guidance."""
-    for attempt in range(CONNECT_MAX_RETRIES):
-        try:
-            return _call_with_rate_retry(lambda: w3.eth.block_number, "block_number")
-        except Exception as e:
-            if attempt + 1 >= CONNECT_MAX_RETRIES:
-                raise RuntimeError(
-                    f"Cannot reach Polygon RPC after {CONNECT_MAX_RETRIES} attempts: {rpc}\n"
-                    f"        Check POLYGON_RPC_URL and that your plan is active. Last error: {e}"
-                ) from e
-            delay = min(2 ** attempt, RATE_LIMIT_BACKOFF_MAX)
-            print(f"  ! RPC connect failed ({e}); retrying in {delay:.0f}s ({attempt + 1}/{CONNECT_MAX_RETRIES})")
-            time.sleep(delay)
-
-
-def _fetch_logs(w3, start: int, end: int):
-    """Fetch OrderFilled logs for [start, end]. Retries forever on 429.
-    If the RPC rejects the block range/response size, stop with guidance to
-    lower POLYGON_MAX_BLOCK_RANGE rather than silently shrinking."""
-    try:
-        return _call_with_rate_retry(
-            lambda: w3.eth.get_logs(
-                {
-                    "fromBlock": start,
-                    "toBlock": end,
-                    "address": CTF_EXCHANGE_V2,
-                    "topics": [ORDERFILLED_TOPIC],
-                }
-            ),
-            f"get_logs {start}-{end}",
-        )
-    except Exception as e:
-        msg = str(e).lower()
-        range_err = any(
-            s in msg
-            for s in ("range", "too many", "limit", "result", "413", "too large", "entity too large")
-        )
-        if range_err:
-            raise RuntimeError(
-                f"RPC rejected blocks {start}-{end} ({end - start + 1} blocks): {e}\n"
-                f"        POLYGON_MAX_BLOCK_RANGE={BLOCK_RANGE} is too high for this RPC — "
-                f"lower it and re-run (it resumes from the saved cursor)."
-            ) from e
-        raise
-
-
-def update_chain() -> None:
+async def _run() -> None:
     if not os.path.isdir(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
 
-    rpc = _rpc_url()
-    w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 30}))
-    # Polygon is PoA (Bor consensus) — extraData exceeds the 32-byte default validator.
-    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+    url = os.environ.get("POLYGON_HYPERSYNC_URL", DEFAULT_URL)
+    token = os.environ.get("HYPERSYNC_API") or None
+    if not token:
+        raise RuntimeError(
+            "HYPERSYNC_API is not set. HyperSync requires a bearer token "
+            "(mandatory since 2025-11-03). Generate a free one with HyperSync "
+            "product access at https://envio.dev/app/api-tokens and add it to "
+            ".env as HYPERSYNC_API."
+        )
+    client = hypersync.HypersyncClient(ClientConfig(url=url, bearer_token=token))
 
-    print(f"RPC: {rpc}")
-    latest = _connect(w3, rpc)
-    safe_latest = latest - CONFIRMATIONS
+    print(f"HyperSync: {url} (with token)")
+
+    height = await client.get_height()
+    safe_height = height - CONFIRMATIONS
     start_block = _load_cursor()
 
-    print(f"Latest block: {latest:,}  (safe: {safe_latest:,} after {CONFIRMATIONS} confs)")
+    print(f"Archive height: {height:,}  (safe: {safe_height:,} after {CONFIRMATIONS} confs)")
     print(f"Resuming from block {start_block:,}")
 
-    if start_block > safe_latest:
+    if start_block > safe_height:
         print("Already up to date.")
         return
 
@@ -239,48 +195,40 @@ def update_chain() -> None:
         with open(OUTPUT_FILE, "w", newline="") as f:
             csv.writer(f).writerow(COLUMNS)
 
-    cur = start_block
-    total = 0
-    ts_cache: dict = {}
+    query = _build_query(start_block, safe_height)
+    receiver = await client.stream(query, StreamConfig())
 
-    while cur <= safe_latest:
-        end = min(cur + BLOCK_RANGE - 1, safe_latest)
-        logs = _fetch_logs(w3, cur, end)
+    total = 0
+    while True:
+        res = await receiver.recv()
+        if res is None:
+            break
+
+        blocks = res.data.blocks or []
+        logs = res.data.logs or []
+
+        ts_by_block = {_as_int(b.number): _as_int(b.timestamp) for b in blocks}
 
         if logs:
-            rows = []
-            for log in logs:
-                row = _decode_log(log)
-                bn = row.pop("_block_number")
-                if bn not in ts_cache:
-                    ts_cache[bn] = _call_with_rate_retry(
-                        lambda b=bn: w3.eth.get_block(b), f"get_block {bn}"
-                    )["timestamp"]
-                row["timestamp"] = ts_cache[bn]
-                rows.append([row[c] for c in COLUMNS])
-
+            rows = [_decode_log(log, ts_by_block) for log in logs]
             with open(OUTPUT_FILE, "a", newline="") as f:
                 csv.writer(f).writerows(rows)
             total += len(rows)
 
-        readable = datetime.fromtimestamp(
-            ts_cache.get(end, time.time()), tz=timezone.utc
-        ).strftime("%Y-%m-%d %H:%M:%S")
+        # res.next_block is the first block NOT yet covered → save directly.
+        _save_cursor(res.next_block)
+
         print(
-            f"  Blocks {cur:>10,} → {end:<10,} ({readable})  "
-            f"events: {len(logs):>4}  total: {total:,}"
+            f"  through block {res.next_block - 1:>10,}  "
+            f"events: {len(logs):>5}  total: {total:,}"
         )
 
-        cur = end + 1
-        _save_cursor(cur)
-
-        # Trim cache so it doesn't grow unboundedly across a long backfill.
-        if len(ts_cache) > 50_000:
-            ts_cache.clear()
-
-        time.sleep(0.05)  # be polite to free-tier RPCs
-
     print(f"Done. Wrote {total:,} new rows to {OUTPUT_FILE}.")
+
+
+def update_chain() -> None:
+    """Sync entrypoint so update.py's ThreadPoolExecutor can call it directly."""
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":
