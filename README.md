@@ -24,8 +24,7 @@ All tuning is via environment variables.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `HYPERSYNC_API` | _(unset)_ | **Required.** Envio HyperSync bearer token (mandatory since 2025-11-03). Generate a free one at [envio.dev/app/api-tokens](https://envio.dev/app/api-tokens) — make sure it has **HyperSync** product access. Without it the endpoint returns 401/403. |
-| `POLYGON_HYPERSYNC_URL` | `https://polygon.hypersync.xyz` | Envio HyperSync endpoint for Polygon. Override only to point at a different network or a self-hosted instance. |
+| `HYPERSYNC_API` | _(unset)_ | **Required.** Envio HyperSync bearer token. Generate a free one at [envio.dev/app/api-tokens](https://envio.dev/app/api-tokens) — make sure it has **HyperSync** product access |
 | `PROCESS_CHUNK_SIZE` | `0` | When `>0`, streams `data/orderFilled.csv` through chunks if your machine has limitations processing the data. Use `500000` if processing OOMs on your machine. |
 
 Set them in `.env` file:
