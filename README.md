@@ -93,7 +93,11 @@ The chain stage streams from Envio HyperSync, which **requires a bearer token** 
    HYPERSYNC_API="your-token-here"
    ```
 
-Without it the run stops immediately with a message telling you to set `HYPERSYNC_API`. The token authenticates the request; a single request scans hundreds of thousands of blocks, so the free-tier rate limit is a non-issue.
+Without it the run stops immediately with a message telling you to set `HYPERSYNC_API`.
+
+### Free vs paid: backfill speed
+
+The free tier is rate-limited, so the first full backfill takes **several hours to a few days**. A **paid [Envio token](https://envio.dev/pricing) is much faster** (no throttling). Just set `HYPERSYNC_API` to it, no code change. The backfill is resumable, so the free tier can also just run unattended.
 
 ## Quick Start
 
@@ -101,7 +105,7 @@ Without it the run stops immediately with a message telling you to set `HYPERSYN
 uv run poly-data        # or: uv run python update.py
 ```
 
-That's it. Runs markets → chain → process in order. **First run is the long one** — the full market list from CLOB takes a couple of minutes, then the initial chain backfill from v2 genesis (~April 2026) over HyperSync runs after it. Subsequent runs only pull deltas.
+That's it. Runs markets → chain → process in order. **First run is the long one** — the full market list from CLOB takes a couple of minutes, then the initial chain backfill from v2 genesis (~April 2026) over HyperSync runs after it (timing depends on your tier — see [Free vs paid](#free-vs-paid-backfill-speed)). Subsequent runs only pull deltas and finish in seconds. The backfill is resumable: stop with Ctrl-C and rerun anytime.
 
 To run any stage individually:
 
