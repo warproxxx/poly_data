@@ -165,9 +165,17 @@ def update_markets(csv_filename: str = MARKETS_CSV, max_workers: int = WAVE) -> 
     done = False
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            def submit_wave(start: int):
+                return [ex.submit(_fetch_page, start + i * PAGE) for i in range(max_workers)]
+
+            wave = submit_wave(offset)
             while not done:
-                offsets = [offset + i * PAGE for i in range(max_workers)]
-                for off, markets in ex.map(_fetch_page, offsets):
+                # Queue the next wave before writing this one, so the workers
+                # keep fetching while the main thread parses and writes rows
+                # instead of idling until the whole wave is on disk.
+                next_wave = submit_wave(offset + max_workers * PAGE)
+                for fut in wave:
+                    off, markets = fut.result()
                     if not markets:
                         done = True
                         continue
@@ -185,6 +193,10 @@ def update_markets(csv_filename: str = MARKETS_CSV, max_workers: int = WAVE) -> 
                 f.flush()
                 _save_state(offset, fetched, columns)
                 print(f"  fetched {fetched:,} markets (scanned through offset {offset:,})")
+                wave = next_wave
+            # The prefetched wave lies past the end of data; drop what hasn't started.
+            for fut in wave:
+                fut.cancel()
     finally:
         f.close()
 
