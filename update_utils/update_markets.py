@@ -163,10 +163,11 @@ def update_markets(csv_filename: str = MARKETS_CSV, max_workers: int = WAVE) -> 
 
     writer = csv.writer(f)
     done = False
+    start, fetched_at_start = time.monotonic(), fetched
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            def submit_wave(start: int):
-                return [ex.submit(_fetch_page, start + i * PAGE) for i in range(max_workers)]
+            def submit_wave(first: int):
+                return [ex.submit(_fetch_page, first + i * PAGE) for i in range(max_workers)]
 
             wave = submit_wave(offset)
             while not done:
@@ -174,8 +175,11 @@ def update_markets(csv_filename: str = MARKETS_CSV, max_workers: int = WAVE) -> 
                 # keep fetching while the main thread parses and writes rows
                 # instead of idling until the whole wave is on disk.
                 next_wave = submit_wave(offset + max_workers * PAGE)
+                waited = 0.0  # time blocked on the network rather than writing
                 for fut in wave:
+                    t = time.monotonic()
                     off, markets = fut.result()
+                    waited += time.monotonic() - t
                     if not markets:
                         done = True
                         continue
@@ -192,7 +196,12 @@ def update_markets(csv_filename: str = MARKETS_CSV, max_workers: int = WAVE) -> 
                 offset += max_workers * PAGE
                 f.flush()
                 _save_state(offset, fetched, columns)
-                print(f"  fetched {fetched:,} markets (scanned through offset {offset:,})")
+                elapsed = time.monotonic() - start
+                print(
+                    f"  fetched {fetched:,} markets (scanned through offset {offset:,})  "
+                    f"{(fetched - fetched_at_start) / elapsed:,.0f} markets/s, "
+                    f"waited {waited:.2f}s on fetches"
+                )
                 wave = next_wave
             # The prefetched wave lies past the end of data; drop what hasn't started.
             for fut in wave:
@@ -201,7 +210,11 @@ def update_markets(csv_filename: str = MARKETS_CSV, max_workers: int = WAVE) -> 
         f.close()
 
     _save_state(offset, fetched, columns, completed=True)
-    print(f"Total markets: {fetched:,}  ->  {csv_filename}")
+    elapsed = time.monotonic() - start
+    print(
+        f"Total markets: {fetched:,}  ->  {csv_filename}  "
+        f"({fetched - fetched_at_start:,} new in {elapsed:.1f}s)"
+    )
     return fetched
 
 
