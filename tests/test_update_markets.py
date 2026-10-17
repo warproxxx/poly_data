@@ -72,3 +72,44 @@ class TestRow:
     def test_missing_tokens_blank(self):
         row = _row({"condition_id": "0xdef"}, ["id", "clobTokenIds"])
         assert row == ["0xdef", ""]
+
+
+class TestUpdateMarketsLoop:
+    """Drive update_markets against a fake CLOB to check the wave pipelining."""
+
+    def _fake_clob(self, monkeypatch, tmp_path, total, page=10):
+        import update_utils.update_markets as um
+
+        monkeypatch.setattr(um, "PAGE", page)
+        monkeypatch.setattr(um, "STATE_FILE", str(tmp_path / "state.json"))
+        calls = []
+
+        def fake_fetch(offset):
+            calls.append(offset)
+            ids = range(offset, min(offset + page, total))
+            return offset, [{"condition_id": f"c{i}", "tokens": [{"token_id": i}]} for i in ids]
+
+        monkeypatch.setattr(um, "_fetch_page", fake_fetch)
+        return um, calls
+
+    def _ids(self, path):
+        import csv
+
+        with open(path, newline="") as f:
+            return [r[0] for r in list(csv.reader(f))[1:]]
+
+    def test_fetches_everything_once_in_order(self, monkeypatch, tmp_path):
+        um, calls = self._fake_clob(monkeypatch, tmp_path, total=95)
+        out = str(tmp_path / "markets.csv")
+        assert um.update_markets(out, max_workers=3) == 95
+        assert self._ids(out) == [f"c{i}" for i in range(95)]
+        assert um._load_state()["completed"] is True
+
+    def test_resume_skips_already_saved(self, monkeypatch, tmp_path):
+        um, _ = self._fake_clob(monkeypatch, tmp_path, total=55)
+        out = str(tmp_path / "markets.csv")
+        um.update_markets(out, max_workers=2)
+        # Simulate new markets appearing since the last run.
+        um, _ = self._fake_clob(monkeypatch, tmp_path, total=73)
+        assert um.update_markets(out, max_workers=2) == 73
+        assert self._ids(out) == [f"c{i}" for i in range(73)]
